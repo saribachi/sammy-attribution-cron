@@ -2,30 +2,31 @@
 """
 Governed attribution classifier for Sammy (portal 244038625).
 
-Writes the derived channel directly to original_source_channel (only-if-blank = write-once in code) (NOT original_source_channel),
-so the HubSpot "Freeze Original Source Channel" workflow copies it into the real field
-write-once. This makes attribution overwrite-proof: re-running this can never corrupt a
-value that is already set.
+ORIGIN-BASED: every contact is attributed by how it actually entered the pipeline,
+so we do not leave large unassigned buckets. Writes original_source_channel directly,
+only when it is currently BLANK (only-if-blank = write-once, enforced in code). Safe to
+re-run; it never overwrites an existing value.
 
-RULES (intent-gated — a raw import with no signal stays blank BY DESIGN):
-  1. UTM present (sammy_utm_* or first_utm)  -> derive channel from UTM
-  2. Native paid signal (hs_analytics_source PAID_SOCIAL/PAID_SEARCH) -> paid_ads
-  3. Record origin:
-       - Aircall-created (dialed a fresh number)          -> cold_call
-       - App signup (Sammy Accounts Sync / Setup)         -> organic_inbound
-       - CSV import / Clay with no engagement             -> leave blank (intent-gated)
+RULES (priority order):
+  1. UTM present (sammy_utm_* / first_utm)              -> derive channel from UTM
+  2. Native paid signal (hs_analytics_source PAID_*)    -> paid_ads
+  3. Record origin (how the record was created):
+       - Aircall-created                                -> cold_call
+       - CSV import / IMPORT label:
+             dialed (has Aircall activity)              -> cold_call   (CSV-then-dial)
+             not dialed                                 -> cold_email  (imported cold list)
+       - Clay / Instantly / Outbound Sync / EmailBison / Sammy Setup -> cold_email
+       - App signup (Sammy Accounts Sync / Database Sync)-> organic_inbound
+       - Manual (CRM_UI / EXTENSION)                    -> user_generated
+       - Inbound (MEETINGS / FORM)                      -> organic_inbound
   4. Native organic signal (ORGANIC_SEARCH/DIRECT/REFERRALS) -> organic_inbound
-  5. Otherwise -> leave blank
-
-Only fills contacts whose original_source_channel is currently BLANK. Contacts that
-already have a channel are left alone (the Freeze workflow protects them anyway).
-Contamination fixes on already-set contacts (e.g. the 12 warm cold_calls) are a
-separate supervised correction, not this pass.
+  5. Has Aircall activity, origin unknown              -> cold_call
+  6. Otherwise                                         -> leave blank (truly unknown)
 
 USAGE
-  export HUBSPOT_TOKEN=pat-na2-e5d783f4-...   # the attribution writer app (30858065)
-  python3 governed_classifier.py             # DRY RUN: report only, no writes
-  python3 governed_classifier.py --commit    # write original_source_channel_input
+  export HUBSPOT_TOKEN=pat-na2-e5d783f4-...   # attribution writer app (30858065)
+  python3 governed_classifier.py             # DRY RUN
+  python3 governed_classifier.py --commit    # write original_source_channel
 """
 import os, sys, json, time, urllib.request, urllib.error
 from collections import Counter
@@ -36,7 +37,7 @@ PAID = {"PAID_SOCIAL", "PAID_SEARCH"}
 ORGANIC = {"ORGANIC_SEARCH", "DIRECT_TRAFFIC", "REFERRALS", "SOCIAL_MEDIA"}
 FIELDS = ["original_source_channel", "hs_analytics_source", "hs_object_source_label",
           "hs_object_source_detail_1", "sammy_utm_source", "sammy_utm_medium",
-          "sammy_utm_campaign", "first_utm", "user_status"]
+          "sammy_utm_campaign", "first_utm", "aircall_last_call_at"]
 
 def req(method, url, body=None):
     data = json.dumps(body).encode() if body else None
@@ -79,49 +80,50 @@ def derive_from_utm(src, med):
     if src in ("instantly", "mailchimp", "klaviyo"): return "cold_email"
     return None
 
+COLD_EMAIL_TOOLS = ("Clay", "Instantly", "Outbound Sync", "EmailBison", "Email Bison", "Sammy Setup")
+
 def classify(p):
     g = lambda k: p.get(k)
+    src = g("hs_analytics_source"); detail = (g("hs_object_source_detail_1") or ""); dl = detail.lower()
+    label = g("hs_object_source_label"); dialed = bool(g("aircall_last_call_at"))
     # 1. UTM
     if g("sammy_utm_source") or g("sammy_utm_medium"):
         ch = derive_from_utm(g("sammy_utm_source"), g("sammy_utm_medium"))
         if ch: return ch, "utm"
-    # 2. native paid
-    if g("hs_analytics_source") in PAID: return "paid_ads", "native_paid"
-    # 3. origin
-    detail = (g("hs_object_source_detail_1") or "")
-    label = g("hs_object_source_label")
-    if "Aircall" in detail: return "cold_call", "aircall_created_cold_dial"
-    if "Accounts Sync" in detail or "Setup" in detail or "Database Sync" in detail:
-        return "organic_inbound", "app_signup"
-    if label == "IMPORT" or "csv" in detail.lower():
-        return None, "raw_import_intent_gated_blank"
+    # 2. native paid ad click
+    if src in PAID: return "paid_ads", "native_paid"
+    # 3. record origin
+    if "aircall" in dl: return "cold_call", "aircall_created"
+    if label == "IMPORT" or "csv" in dl:
+        return ("cold_call", "csv_then_dialed") if dialed else ("cold_email", "csv_cold_list")
+    if any(t in detail for t in COLD_EMAIL_TOOLS): return "cold_email", "cold_email_tool"
+    if "Accounts Sync" in detail or "Database Sync" in detail: return "organic_inbound", "app_signup"
+    if label in ("CRM_UI", "EXTENSION"): return "user_generated", "manual_add"
+    if label in ("MEETINGS", "FORM"): return "organic_inbound", "inbound"
     # 4. native organic
-    if g("hs_analytics_source") in ORGANIC: return "organic_inbound", "native_organic"
-    return None, "no_signal_blank"
+    if src in ORGANIC: return "organic_inbound", "native_organic"
+    # 5. dialed, origin unknown
+    if dialed: return "cold_call", "dialed_unknown_origin"
+    return None, "truly_unknown"
 
 def main():
     if not TOKEN: sys.exit("Set HUBSPOT_TOKEN to the attribution writer token (30858065).")
     recs = all_contacts()
     blanks = [r for r in recs if not r["properties"].get("original_source_channel")]
-    print(f"Total contacts: {len(recs)}  |  currently blank original_source_channel: {len(blanks)}\n")
-    plan, reasons = Counter(), Counter()
-    to_write = []
+    print(f"Total contacts: {len(recs)}  |  blank original_source_channel: {len(blanks)}\n")
+    plan, reasons, to_write = Counter(), Counter(), []
     for r in blanks:
-        ch, reason = classify(r["properties"])
-        reasons[reason] += 1
-        if ch:
-            plan[ch] += 1
-            to_write.append((r["id"], ch))
-    print("Would ATTRIBUTE (write to original_source_channel_input):")
+        ch, reason = classify(r["properties"]); reasons[reason] += 1
+        if ch: plan[ch] += 1; to_write.append((r["id"], ch))
+    print("Would ATTRIBUTE:")
     for ch, n in plan.most_common(): print(f"   {ch:18} {n}")
-    print(f"\nWould leave BLANK (intent-gated, by design): {len(blanks) - len(to_write)}")
     print("Reason breakdown:")
-    for reason, n in reasons.most_common(): print(f"   {reason:34} {n}")
-    print(f"\nTotal to write: {len(to_write)}")
+    for reason, n in reasons.most_common(): print(f"   {reason:24} {n}")
+    print(f"\nWould leave blank (truly unknown): {len(blanks) - len(to_write)}")
+    print(f"Total to write: {len(to_write)}")
     if not COMMIT:
-        print("\nDRY RUN — no writes. Re-run with --commit to write original_source_channel_input.")
-        return
-    print("\nCOMMITTING to original_source_channel_input ...")
+        print("\nDRY RUN. Re-run with --commit to write."); return
+    print("\nCOMMITTING to original_source_channel ...")
     ok = err = 0
     for i in range(0, len(to_write), 100):
         batch = to_write[i:i+100]
@@ -130,7 +132,7 @@ def main():
         if st in (200, 201, 202): ok += len(batch)
         else: err += len(batch); print("  batch err", st, str(d)[:150])
         time.sleep(0.3)
-    print(f"\nDone. {ok} written to _input, {err} errors. The Freeze workflow copies each into original_source_channel once.")
+    print(f"\nDone. {ok} written, {err} errors.")
 
 if __name__ == "__main__":
     main()
