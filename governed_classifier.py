@@ -2,7 +2,7 @@
 """
 Governed attribution classifier for Sammy (portal 244038625).
 
-Writes the derived channel to original_source_channel_input (NOT original_source_channel),
+Writes the derived channel directly to original_source_channel (only-if-blank = write-once in code) (NOT original_source_channel),
 so the HubSpot "Freeze Original Source Channel" workflow copies it into the real field
 write-once. This makes attribution overwrite-proof: re-running this can never corrupt a
 value that is already set.
@@ -125,7 +125,7 @@ def main():
     ok = err = 0
     for i in range(0, len(to_write), 100):
         batch = to_write[i:i+100]
-        inputs = [{"id": cid, "properties": {"original_source_channel_input": ch}} for cid, ch in batch]
+        inputs = [{"id": cid, "properties": {"original_source_channel": ch}} for cid, ch in batch]
         st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/batch/update", {"inputs": inputs})
         if st in (200, 201, 202): ok += len(batch)
         else: err += len(batch); print("  batch err", st, str(d)[:150])
