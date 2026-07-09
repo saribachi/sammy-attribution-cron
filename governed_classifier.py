@@ -116,6 +116,21 @@ def classify(p):
 def main():
     if not TOKEN: sys.exit("Set HUBSPOT_TOKEN to the attribution writer token (30858065).")
     recs = all_contacts()
+    # Second responsibility: WE own first_utm. Compose it (write-once) from the raw
+    # sammy_utm_* fields that the Sammy app writes. Never overwrites an existing value.
+    futm = []
+    for r in recs:
+        p = r["properties"]
+        if not p.get("first_utm") and p.get("sammy_utm_source"):
+            joined = "|".join(filter(None, [p.get("sammy_utm_source"), p.get("sammy_utm_medium"), p.get("sammy_utm_campaign")]))
+            if joined: futm.append((r["id"], joined))
+    if futm and COMMIT:
+        for i in range(0, len(futm), 100):
+            batch = futm[i:i+100]
+            req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/batch/update",
+                {"inputs": [{"id": cid, "properties": {"first_utm": v}} for cid, v in batch]})
+            time.sleep(0.3)
+    if futm: print(f"first_utm composed (write-once) for {len(futm)} contacts" + ("" if COMMIT else " [dry-run]"))
     blanks = [r for r in recs if not r["properties"].get("original_source_channel")]
     print(f"Total contacts: {len(recs)}  |  blank original_source_channel: {len(blanks)}\n")
     plan, reasons, to_write = Counter(), Counter(), []
