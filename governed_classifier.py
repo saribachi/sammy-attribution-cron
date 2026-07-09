@@ -99,7 +99,7 @@ def classify(p):
     if any(t in detail for t in COLD_EMAIL_TOOLS): return "cold_email", "cold_email_tool"
     if "Accounts Sync" in detail or "Database Sync" in detail: return "organic_inbound", "app_signup"
     if label in ("CRM_UI", "EXTENSION"): return "user_generated", "manual_add"
-    if label in ("MEETINGS", "FORM"): return "organic_inbound", "inbound"
+    if label in ("MEETINGS", "FORM") or any(m in detail for m in ("Google Meet","Zoom","Calendly","Meetings")): return "organic_inbound", "inbound"
     # 4. native organic
     if src in ORGANIC: return "organic_inbound", "native_organic"
     # 5. dialed, origin unknown
