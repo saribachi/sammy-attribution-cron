@@ -35,9 +35,12 @@ TOKEN = os.environ.get("HUBSPOT_TOKEN", "")
 COMMIT = "--commit" in sys.argv
 PAID = {"PAID_SOCIAL", "PAID_SEARCH"}
 ORGANIC = {"ORGANIC_SEARCH", "DIRECT_TRAFFIC", "REFERRALS", "SOCIAL_MEDIA"}
+import re as _re
+PAID_URL_RX = _re.compile(r"fbclid|gclid=|ttclid|utm_source=(facebook|meta|instagram|fb)|utm_medium=(cpc|ppc|paid)", _re.I)
 FIELDS = ["original_source_channel", "hs_analytics_source", "hs_object_source_label",
           "hs_object_source_detail_1", "sammy_utm_source", "sammy_utm_medium",
-          "sammy_utm_campaign", "first_utm", "aircall_last_call_at"]
+          "sammy_utm_campaign", "first_utm", "aircall_last_call_at",
+          "hs_google_click_id", "hs_facebook_click_id", "hs_analytics_first_url", "hs_analytics_last_url"]
 
 def req(method, url, body=None):
     data = json.dumps(body).encode() if body else None
@@ -92,6 +95,10 @@ def classify(p):
         if ch: return ch, "utm"
     # 2. native paid ad click
     if src in PAID: return "paid_ads", "native_paid"
+    # 2b. ad click IDs or paid params captured by HubSpot tracking
+    if g("hs_google_click_id") or g("hs_facebook_click_id"): return "paid_ads", "ad_click_id"
+    urls = " ".join(filter(None, [g("hs_analytics_first_url"), g("hs_analytics_last_url")]))
+    if PAID_URL_RX.search(urls): return "paid_ads", "paid_params_in_url"
     # 3. record origin
     if "aircall" in dl: return "cold_call", "aircall_created"
     if label == "IMPORT" or "csv" in dl:
