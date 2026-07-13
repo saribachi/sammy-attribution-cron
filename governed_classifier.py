@@ -113,6 +113,17 @@ def classify(p):
     if dialed: return "cold_call", "dialed_unknown_origin"
     return None, "truly_unknown"
 
+
+def first_call_direction(cid):
+    """Earliest associated call's direction: OUTBOUND = we dialed them, INBOUND = they called us."""
+    st, a = req("GET", f"https://api.hubapi.com/crm/v4/objects/contacts/{cid}/associations/calls")
+    ids = [str(x["toObjectId"]) for x in (a.get("results") or [])][:20]
+    if not ids: return None
+    st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/calls/batch/read",
+                {"properties": ["hs_call_direction", "hs_timestamp"], "inputs": [{"id": x} for x in ids]})
+    calls = sorted(d.get("results", []), key=lambda c: c["properties"].get("hs_timestamp") or "9")
+    return calls[0]["properties"].get("hs_call_direction") if calls else None
+
 def main():
     if not TOKEN: sys.exit("Set HUBSPOT_TOKEN to the attribution writer token (30858065).")
     recs = all_contacts()
@@ -135,7 +146,13 @@ def main():
     print(f"Total contacts: {len(recs)}  |  blank original_source_channel: {len(blanks)}\n")
     plan, reasons, to_write = Counter(), Counter(), []
     for r in blanks:
-        ch, reason = classify(r["properties"]); reasons[reason] += 1
+        ch, reason = classify(r["properties"])
+        # Direction gate: an Aircall-origin contact whose FIRST call was INBOUND called us,
+        # so it is inbound interest, not a cold call.
+        if ch == "cold_call" and reason in ("aircall_created", "dialed_unknown_origin"):
+            if first_call_direction(r["id"]) == "INBOUND":
+                ch, reason = "organic_inbound", "inbound_caller"
+        reasons[reason] += 1
         if ch: plan[ch] += 1; to_write.append((r["id"], ch))
     print("Would ATTRIBUTE:")
     for ch, n in plan.most_common(): print(f"   {ch:18} {n}")
