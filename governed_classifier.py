@@ -37,7 +37,7 @@ PAID = {"PAID_SOCIAL", "PAID_SEARCH"}
 ORGANIC = {"ORGANIC_SEARCH", "DIRECT_TRAFFIC", "REFERRALS", "SOCIAL_MEDIA"}
 import re as _re
 PAID_URL_RX = _re.compile(r"fbclid|gclid=|ttclid|utm_source=(facebook|meta|instagram|fb)|utm_medium=(cpc|ppc|paid)", _re.I)
-FIELDS = ["original_source_channel", "hs_analytics_source", "hs_object_source_label",
+FIELDS = ["email", "original_source_channel", "hs_analytics_source", "hs_object_source_label",
           "hs_object_source_detail_1", "sammy_utm_source", "sammy_utm_medium",
           "sammy_utm_campaign", "first_utm", "aircall_last_call_at",
           "hs_google_click_id", "hs_facebook_click_id", "hs_analytics_first_url", "hs_analytics_last_url"]
@@ -124,6 +124,43 @@ def first_call_direction(cid):
     calls = sorted(d.get("results", []), key=lambda c: c["properties"].get("hs_timestamp") or "9")
     return calls[0]["properties"].get("hs_call_direction") if calls else None
 
+
+PERSONAL_DOMAINS = {"gmail.com","hotmail.com","outlook.com","icloud.com","live.com","live.com.au","live.co.uk",
+ "yahoo.com","yahoo.com.au","bigpond.com","bigpond.net.au","ozemail.com.au","me.com","msn.com",
+ "privaterelay.appleid.com","hotmail.com.au","aol.com","proton.me","protonmail.com"}
+
+def business_domain(email):
+    d = (email or "").split("@")[-1].lower()
+    return d if d and "." in d and d not in PERSONAL_DOMAINS else None
+
+def stamp_deal_sources():
+    """Item 2: deal_source = associated contact's person channel (write-once: blanks only)."""
+    ids, after = [], None
+    while True:
+        b = {"filterGroups": [{"filters": [{"propertyName": "deal_source", "operator": "NOT_HAS_PROPERTY"}]}], "limit": 100}
+        if after: b["after"] = after
+        st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/deals/search", b)
+        ids += [r["id"] for r in d.get("results", [])]
+        after = d.get("paging", {}).get("next", {}).get("after")
+        if not after: break
+        time.sleep(0.2)
+    updates = []
+    for did in ids:
+        st, a = req("GET", f"https://api.hubapi.com/crm/v4/objects/deals/{did}/associations/contacts")
+        res = a.get("results") or []
+        if not res: continue
+        cid = str(res[0]["toObjectId"])
+        st, c = req("GET", f"https://api.hubapi.com/crm/v3/objects/contacts/{cid}?properties=person_original_channel,original_source_channel")
+        p = c.get("properties", {}) if st == 200 else {}
+        ch = p.get("person_original_channel") or p.get("original_source_channel")
+        if ch: updates.append({"id": did, "properties": {"deal_source": ch}})
+        time.sleep(0.1)
+    if COMMIT:
+        for i in range(0, len(updates), 100):
+            req("POST", "https://api.hubapi.com/crm/v3/objects/deals/batch/update", {"inputs": updates[i:i+100]})
+            time.sleep(0.3)
+    print(f"deal_source: {len(ids)} blank deals, {len(updates)} stamped from contact channel" + ("" if COMMIT else " [dry-run]"))
+
 def main():
     if not TOKEN: sys.exit("Set HUBSPOT_TOKEN to the attribution writer token (30858065).")
     recs = all_contacts()
@@ -144,9 +181,20 @@ def main():
     if futm: print(f"first_utm composed (write-once) for {len(futm)} contacts" + ("" if COMMIT else " [dry-run]"))
     blanks = [r for r in recs if not r["properties"].get("original_source_channel")]
     print(f"Total contacts: {len(recs)}  |  blank original_source_channel: {len(blanks)}\n")
+    # Item 3: same-domain inheritance index. If colleagues at a business domain are
+    # already attributed, a signal-less colleague record inherits the majority channel.
+    dom_idx = {}
+    for r in recs:
+        ch0 = r["properties"].get("original_source_channel")
+        d0 = business_domain(r["properties"].get("email"))
+        if ch0 and d0: dom_idx.setdefault(d0, Counter())[ch0] += 1
     plan, reasons, to_write = Counter(), Counter(), []
     for r in blanks:
         ch, reason = classify(r["properties"])
+        if not ch:
+            d0 = business_domain(r["properties"].get("email"))
+            if d0 and d0 in dom_idx:
+                ch, reason = dom_idx[d0].most_common(1)[0][0], "same_domain_inheritance"
         # Direction gate: an Aircall-origin contact whose FIRST call was INBOUND called us,
         # so it is inbound interest, not a cold call.
         if ch == "cold_call" and reason in ("aircall_created", "dialed_unknown_origin"):
@@ -172,6 +220,7 @@ def main():
         else: err += len(batch); print("  batch err", st, str(d)[:150])
         time.sleep(0.3)
     print(f"\nDone. {ok} written, {err} errors.")
+    stamp_deal_sources()
 
 if __name__ == "__main__":
     main()
