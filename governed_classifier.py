@@ -167,8 +167,15 @@ def normalize_phones(recs):
     unparseable by HubSpot, which breaks click-to-call. Normalize to E.164 hourly."""
     import re as _re2
     def fix(p):
-        if not p or p.strip().startswith("+"): return None
+        if not p: return None
         d = _re2.sub(r"\D", "", p)
+        if p.strip().startswith("+"):
+            # +61 0xxxxxxxxx double-prefix: drop the 0 after 61
+            if d.startswith("610") and len(d) == 12: return "+61" + d[3:]
+            # AU 1800/1300 wrongly saved with +1: 9 digits starting 800/300
+            if d.startswith("1800") and len(d) == 10 and p.strip().startswith("+1 8"): return "+61" + d
+            if d.startswith("1300") and len(d) == 10 and p.strip().startswith("+1 3"): return "+61" + d
+            return None
         if d.startswith("61") and len(d) in (11, 12): return "+" + d
         if (d.startswith("1300") or d.startswith("1800")) and len(d) == 10: return "+61" + d
         if d.startswith("13") and len(d) == 6: return "+61" + d
