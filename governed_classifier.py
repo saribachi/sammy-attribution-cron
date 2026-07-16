@@ -39,7 +39,7 @@ import re as _re
 PAID_URL_RX = _re.compile(r"fbclid|gclid=|ttclid|utm_source=(facebook|meta|instagram|fb)|utm_medium=(cpc|ppc|paid)", _re.I)
 FIELDS = ["email", "original_source_channel", "hs_analytics_source", "hs_object_source_label",
           "hs_object_source_detail_1", "sammy_utm_source", "sammy_utm_medium",
-          "sammy_utm_campaign", "first_utm", "aircall_last_call_at",
+          "sammy_utm_campaign", "first_utm", "aircall_last_call_at", "phone", "mobilephone",
           "hs_google_click_id", "hs_facebook_click_id", "hs_analytics_first_url", "hs_analytics_last_url"]
 
 def req(method, url, body=None):
@@ -161,6 +161,32 @@ def stamp_deal_sources():
             time.sleep(0.3)
     print(f"deal_source: {len(ids)} blank deals, {len(updates)} stamped from contact channel" + ("" if COMMIT else " [dry-run]"))
 
+
+def normalize_phones(recs):
+    """AU numbers stored without +61 (bare 1300/1800, 04 mobiles, 0x landlines) are
+    unparseable by HubSpot, which breaks click-to-call. Normalize to E.164 hourly."""
+    import re as _re2
+    def fix(p):
+        if not p or p.strip().startswith("+"): return None
+        d = _re2.sub(r"\D", "", p)
+        if d.startswith("61") and len(d) in (11, 12): return "+" + d
+        if (d.startswith("1300") or d.startswith("1800")) and len(d) == 10: return "+61" + d
+        if d.startswith("13") and len(d) == 6: return "+61" + d
+        if d.startswith("0") and len(d) == 10: return "+61" + d[1:]
+        return None
+    updates = []
+    for r in recs:
+        props = {}
+        for f in ("phone", "mobilephone"):
+            n = fix(r["properties"].get(f))
+            if n: props[f] = n
+        if props: updates.append({"id": r["id"], "properties": props})
+    if updates and COMMIT:
+        for i in range(0, len(updates), 100):
+            req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/batch/update", {"inputs": updates[i:i+100]})
+            time.sleep(0.3)
+    if updates: print(f"phones normalized to E.164: {len(updates)}" + ("" if COMMIT else " [dry-run]"))
+
 def main():
     if not TOKEN: sys.exit("Set HUBSPOT_TOKEN to the attribution writer token (30858065).")
     recs = all_contacts()
@@ -220,6 +246,7 @@ def main():
         else: err += len(batch); print("  batch err", st, str(d)[:150])
         time.sleep(0.3)
     print(f"\nDone. {ok} written, {err} errors.")
+    normalize_phones(recs)
     stamp_deal_sources()
 
 if __name__ == "__main__":
