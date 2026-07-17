@@ -203,6 +203,7 @@ def fix_call_owners():
     RX = _re3.compile(r"made by\s*<strong>\s*([A-Za-z]+)", _re3.I)
     since = (_dt.datetime.utcnow() - _dt.timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
     fixes = []; after = None
+    total = parsed = 0; unmapped = Counter()
     while True:
         b = {"filterGroups": [{"filters": [
               {"propertyName": "hs_call_app_id", "operator": "EQ", "value": "36503"},
@@ -211,10 +212,16 @@ def fix_call_owners():
         if after: b["after"] = after
         st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/calls/search", b)
         for c in d.get("results", []):
+            total += 1
             m = RX.search(c["properties"].get("hs_call_body") or "")
             if not m: continue
-            want = NAME2OWNER.get(m.group(1).lower())
-            if want and c["properties"].get("hubspot_owner_id") != want:
+            parsed += 1
+            agent = m.group(1).lower()
+            want = NAME2OWNER.get(agent)
+            if not want:
+                unmapped[agent] += 1
+                continue
+            if c["properties"].get("hubspot_owner_id") != want:
                 fixes.append({"id": c["id"], "properties": {"hubspot_owner_id": want}})
         after = d.get("paging", {}).get("next", {}).get("after")
         if not after: break
@@ -223,7 +230,11 @@ def fix_call_owners():
         for i in range(0, len(fixes), 100):
             req("POST", "https://api.hubapi.com/crm/v3/objects/calls/batch/update", {"inputs": fixes[i:i+100]})
             time.sleep(0.3)
-    if fixes: print(f"call owners corrected to true caller: {len(fixes)}" + ("" if COMMIT else " [dry-run]"))
+    print(f"call-owner healing: {total} calls in window, {parsed} parsed, {len(fixes)} corrected")
+    if unmapped:
+        print(f"WARNING unmapped agents (calls stay contact-owner-owned, need HubSpot seats or mapping): {dict(unmapped)}")
+    if total >= 10 and parsed / max(total, 1) < 0.7:
+        print(f"WARNING call-note parse rate {round(parsed/total*100)}% — Aircall may have changed its note format; healer degraded")
 
 def main():
     if not TOKEN: sys.exit("Set HUBSPOT_TOKEN to the attribution writer token (30858065).")
