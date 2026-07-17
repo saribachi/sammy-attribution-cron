@@ -194,6 +194,37 @@ def normalize_phones(recs):
             time.sleep(0.3)
     if updates: print(f"phones normalized to E.164: {len(updates)}" + ("" if COMMIT else " [dry-run]"))
 
+
+def fix_call_owners():
+    """Aircall logs the true agent only in the call note; HubSpot assigns the activity
+    to the CONTACT owner. Re-own recent calls to the person who actually dialed."""
+    import re as _re3, datetime as _dt
+    NAME2OWNER = {"krishna": "162267743", "lucas": "86929887", "jared": "160312345", "chris": "162042962"}
+    RX = _re3.compile(r"made by\s*<strong>\s*([A-Za-z]+)", _re3.I)
+    since = (_dt.datetime.utcnow() - _dt.timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    fixes = []; after = None
+    while True:
+        b = {"filterGroups": [{"filters": [
+              {"propertyName": "hs_call_app_id", "operator": "EQ", "value": "36503"},
+              {"propertyName": "hs_timestamp", "operator": "GTE", "value": since}]}],
+             "properties": ["hs_call_body", "hubspot_owner_id"], "limit": 100}
+        if after: b["after"] = after
+        st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/calls/search", b)
+        for c in d.get("results", []):
+            m = RX.search(c["properties"].get("hs_call_body") or "")
+            if not m: continue
+            want = NAME2OWNER.get(m.group(1).lower())
+            if want and c["properties"].get("hubspot_owner_id") != want:
+                fixes.append({"id": c["id"], "properties": {"hubspot_owner_id": want}})
+        after = d.get("paging", {}).get("next", {}).get("after")
+        if not after: break
+        time.sleep(0.2)
+    if fixes and COMMIT:
+        for i in range(0, len(fixes), 100):
+            req("POST", "https://api.hubapi.com/crm/v3/objects/calls/batch/update", {"inputs": fixes[i:i+100]})
+            time.sleep(0.3)
+    if fixes: print(f"call owners corrected to true caller: {len(fixes)}" + ("" if COMMIT else " [dry-run]"))
+
 def main():
     if not TOKEN: sys.exit("Set HUBSPOT_TOKEN to the attribution writer token (30858065).")
     recs = all_contacts()
@@ -255,6 +286,7 @@ def main():
     print(f"\nDone. {ok} written, {err} errors.")
     normalize_phones(recs)
     stamp_deal_sources()
+    fix_call_owners()
 
 if __name__ == "__main__":
     main()
