@@ -200,9 +200,10 @@ def fix_call_owners():
     to the CONTACT owner. Re-own recent calls to the person who actually dialed."""
     import re as _re3, datetime as _dt
     NAME2OWNER = {"krishna": "162267743", "lucas": "86929887", "jared": "160312345", "chris": "162042962",
-                  # rollup decision (Jul 17): non-seated Aircall agents attribute to Krishna,
-                  # keeping Lucas's dial counts strictly his own
-                  "ekaterina": "162267743", "liam": "162267743", "delia": "162267743"}
+                  # rollup decision (Jul 17/18): Liam rolls up to Krishna. Ekaterina and
+                  # Delia were never Sammy agents (mistake); their calls are staged for
+                  # deletion and any NEW call from them should fire the unmapped WARNING.
+                  "liam": "162267743"}
     RX = _re3.compile(r"made by\s*<strong>\s*([A-Za-z]+)", _re3.I)
     since = (_dt.datetime.utcnow() - _dt.timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
     fixes = []; after = None
