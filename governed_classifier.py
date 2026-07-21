@@ -162,6 +162,44 @@ def stamp_deal_sources():
     print(f"deal_source: {len(ids)} blank deals, {len(updates)} stamped from contact channel" + ("" if COMMIT else " [dry-run]"))
 
 
+# Monthly plan value per sammy_pricing_plan (annual_950 = 950/12). Deal amounts
+# follow the team's existing convention of monthly plan dollars; the $10 promo
+# (sammy_promo_code) is deducted so deal reports tie to dashboard MRR.
+PLAN_AMOUNT = {"founder_59": 59, "monthly_99": 99, "annual_950": 79}
+
+
+def stamp_deal_amounts():
+    """amount = associated contact's monthly plan value (write-once: blanks only).
+    Contacts on free or no plan are skipped; manual amounts are never touched."""
+    ids, after = [], None
+    while True:
+        b = {"filterGroups": [{"filters": [{"propertyName": "amount", "operator": "NOT_HAS_PROPERTY"}]}], "limit": 100}
+        if after: b["after"] = after
+        st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/deals/search", b)
+        ids += [r["id"] for r in d.get("results", [])]
+        after = d.get("paging", {}).get("next", {}).get("after")
+        if not after: break
+        time.sleep(0.2)
+    updates = []
+    for did in ids:
+        st, a = req("GET", f"https://api.hubapi.com/crm/v4/objects/deals/{did}/associations/contacts")
+        res = a.get("results") or []
+        if not res: continue
+        cid = str(res[0]["toObjectId"])
+        st, c = req("GET", f"https://api.hubapi.com/crm/v3/objects/contacts/{cid}?properties=sammy_pricing_plan,sammy_promo_code")
+        p = c.get("properties", {}) if st == 200 else {}
+        amt = PLAN_AMOUNT.get(p.get("sammy_pricing_plan"))
+        if amt is None: continue
+        if p.get("sammy_promo_code"): amt = max(amt - 10, 0)
+        updates.append({"id": did, "properties": {"amount": str(amt)}})
+        time.sleep(0.1)
+    if COMMIT:
+        for i in range(0, len(updates), 100):
+            req("POST", "https://api.hubapi.com/crm/v3/objects/deals/batch/update", {"inputs": updates[i:i+100]})
+            time.sleep(0.3)
+    print(f"deal_amount: {len(ids)} blank-amount deals, {len(updates)} stamped from plan value" + ("" if COMMIT else " [dry-run]"))
+
+
 def normalize_phones(recs):
     """AU numbers stored without +61 (bare 1300/1800, 04 mobiles, 0x landlines) are
     unparseable by HubSpot, which breaks click-to-call. Normalize to E.164 hourly."""
@@ -301,6 +339,7 @@ def main():
     print(f"\nDone. {ok} written, {err} errors.")
     normalize_phones(recs)
     stamp_deal_sources()
+    stamp_deal_amounts()
     fix_call_owners()
 
 if __name__ == "__main__":
