@@ -166,6 +166,9 @@ def stamp_deal_sources():
 # follow the team's existing convention of monthly plan dollars; the $10 promo
 # (sammy_promo_code) is deducted so deal reports tie to dashboard MRR.
 PLAN_AMOUNT = {"founder_59": 59, "monthly_99": 99, "annual_950": 79}
+# Recurring monthly discounts only. One-time coupons (oJiHwI0k / FIRSTMO50 =
+# 50% off first month) do not reduce the ongoing amount and stay out of this map.
+PROMO_MONTHLY_DISCOUNT = {"qRlQX1PO": 10}
 
 
 def stamp_deal_amounts():
@@ -190,7 +193,8 @@ def stamp_deal_amounts():
         p = c.get("properties", {}) if st == 200 else {}
         amt = PLAN_AMOUNT.get(p.get("sammy_pricing_plan"))
         if amt is None: continue
-        if p.get("sammy_promo_code"): amt = max(amt - 10, 0)
+        disc = PROMO_MONTHLY_DISCOUNT.get(p.get("sammy_promo_code"), 0)
+        if disc: amt = max(amt - disc, 0)
         updates.append({"id": did, "properties": {"amount": str(amt)}})
         time.sleep(0.1)
     if COMMIT:
