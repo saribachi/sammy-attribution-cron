@@ -204,6 +204,81 @@ def stamp_deal_amounts():
     print(f"deal_amount: {len(ids)} blank-amount deals, {len(updates)} stamped from plan value" + ("" if COMMIT else " [dry-run]"))
 
 
+LUCAS = "86929887"
+# Auto-generated or previously groomed subjects we are allowed to manage.
+MANAGED_SUBJECTS = ("call this lead immediately", "call new lead", "follow up with ",
+                    "trial convert:", "winback:", "cold call:", "enrich first", "upgrade call:",
+                    "onboarding nudge:", "check in:")
+SYS_INBOX = ("support@", "noreply@", "no-reply@", "notifications@", "postmaster@", "mailer-daemon@", "help@")
+
+
+def groom_lucas_tasks():
+    """Rename + reprioritize Lucas's open auto-tasks by what the contact IS now.
+    paid/churned contacts: task archived (Chris's standing rule, Jul 28).
+    Hand-written tasks (non-managed subjects) are never touched."""
+    tasks, after = [], None
+    while True:
+        b = {"filterGroups": [{"filters": [
+            {"propertyName": "hubspot_owner_id", "operator": "EQ", "value": LUCAS},
+            {"propertyName": "hs_task_status", "operator": "NEQ", "value": "COMPLETED"}]}],
+            "properties": ["hs_task_subject", "hs_task_priority"], "limit": 100}
+        if after: b["after"] = after
+        st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/tasks/search", b)
+        tasks += d.get("results", [])
+        after = d.get("paging", {}).get("next", {}).get("after")
+        if not after: break
+        time.sleep(0.2)
+    managed = [t for t in tasks if (t["properties"].get("hs_task_subject") or "").strip().lower().startswith(MANAGED_SUBJECTS)]
+
+    assoc = {}
+    for i in range(0, len(managed), 100):
+        st, a = req("POST", "https://api.hubapi.com/crm/v4/associations/tasks/contacts/batch/read",
+                    {"inputs": [{"id": t["id"]} for t in managed[i:i+100]]})
+        for r in a.get("results", []):
+            to = r.get("to") or []
+            if to: assoc[str(r["from"]["id"])] = str(to[0]["toObjectId"])
+        time.sleep(0.2)
+
+    cids = sorted(set(assoc.values()))
+    cinfo = {}
+    for i in range(0, len(cids), 100):
+        st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/batch/read",
+                    {"inputs": [{"id": c} for c in cids[i:i+100]],
+                     "properties": ["email", "firstname", "lastname", "user_status", "phone", "hs_calculated_phone_number"]})
+        for r in d.get("results", []): cinfo[r["id"]] = r["properties"]
+        time.sleep(0.2)
+
+    updates, archives = [], []
+    for t in managed:
+        cid = assoc.get(t["id"])
+        if not cid or cid not in cinfo: continue
+        c = cinfo[cid]
+        email = (c.get("email") or "").lower()
+        name = " ".join(x for x in (c.get("firstname"), c.get("lastname")) if x) or c.get("email") or "contact"
+        status = c.get("user_status")
+        if status in ("paid_customer", "churned") or any(email.startswith(p) for p in SYS_INBOX):
+            archives.append(t["id"]); continue
+        has_phone = bool(c.get("hs_calculated_phone_number") or c.get("phone"))
+        if status == "active_trial":            subject, prio = f"Trial convert: {name}", "HIGH"
+        elif status == "trial_expired":         subject, prio = f"Winback: {name}", "MEDIUM"
+        elif status == "free":                  subject, prio = f"Upgrade call: {name}", "MEDIUM"
+        elif status == "incomplete_onboarding": subject, prio = f"Onboarding nudge: {name}", "MEDIUM"
+        elif status:                            subject, prio = f"Check in: {name}", "MEDIUM"
+        elif has_phone:                         subject, prio = f"Cold call: {name}", "MEDIUM"
+        else:                                   subject, prio = f"Enrich first (no phone): {name}", "LOW"
+        p = t["properties"]
+        if p.get("hs_task_subject") != subject or p.get("hs_task_priority") != prio:
+            updates.append({"id": t["id"], "properties": {"hs_task_subject": subject, "hs_task_priority": prio}})
+    if COMMIT:
+        for i in range(0, len(updates), 100):
+            req("POST", "https://api.hubapi.com/crm/v3/objects/tasks/batch/update", {"inputs": updates[i:i+100]})
+            time.sleep(0.3)
+        for i in range(0, len(archives), 100):
+            req("POST", "https://api.hubapi.com/crm/v3/objects/tasks/batch/archive", {"inputs": [{"id": x} for x in archives[i:i+100]]})
+            time.sleep(0.3)
+    print(f"task groomer: {len(managed)} managed tasks, {len(updates)} renamed/reprioritized, {len(archives)} archived (contact now paid/churned/system-inbox)" + ("" if COMMIT else " [dry-run]"))
+
+
 def normalize_phones(recs):
     """AU numbers stored without +61 (bare 1300/1800, 04 mobiles, 0x landlines) are
     unparseable by HubSpot, which breaks click-to-call. Normalize to E.164 hourly."""
@@ -344,6 +419,7 @@ def main():
     normalize_phones(recs)
     stamp_deal_sources()
     stamp_deal_amounts()
+    groom_lucas_tasks()
     fix_call_owners()
 
 if __name__ == "__main__":
