@@ -259,6 +259,10 @@ def groom_lucas_tasks():
         if status in ("paid_customer", "churned") or any(email.startswith(p) for p in SYS_INBOX):
             archives.append(t["id"]); continue
         has_phone = bool(c.get("hs_calculated_phone_number") or c.get("phone"))
+        # Sign-in-with-Apple relay addresses with no phone: unreachable ghost,
+        # and the anonymized email can never be waterfall-enriched (Chris, Jul 28)
+        if email.endswith("@privaterelay.appleid.com") and not has_phone:
+            archives.append(t["id"]); continue
         if status == "active_trial":            subject, prio = f"Trial convert: {name}", "HIGH"
         elif status == "trial_expired":         subject, prio = f"Winback: {name}", "MEDIUM"
         elif status == "free":                  subject, prio = f"Upgrade call: {name}", "MEDIUM"
