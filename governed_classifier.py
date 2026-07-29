@@ -283,6 +283,83 @@ def groom_lucas_tasks():
     print(f"task groomer: {len(managed)} managed tasks, {len(updates)} renamed/reprioritized, {len(archives)} archived (contact now paid/churned/system-inbox)" + ("" if COMMIT else " [dry-run]"))
 
 
+RATION_PER_DAY = int(os.environ.get("LUCAS_RATION_PER_DAY", "100"))  # matches rep dial target
+
+
+def _mel_due_ts(mel_date):
+    """hs_timestamp for 8am Melbourne on mel_date = 22:00Z the prior day (AEST)."""
+    from datetime import datetime, timedelta
+    d = datetime(mel_date.year, mel_date.month, mel_date.day) - timedelta(days=1)
+    return d.strftime("%Y-%m-%dT22:00:00Z")
+
+
+def ration_lucas_tasks():
+    """Deal Lucas a finishable day: up to RATION_PER_DAY managed tasks due today
+    (Melbourne), remainder spread over following days by priority then age.
+    Tasks already due today are never pushed out. Enrich-first parks +7 days."""
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+    today = datetime.now(ZoneInfo("Australia/Melbourne")).date()
+
+    tasks, after = [], None
+    while True:
+        b = {"filterGroups": [{"filters": [
+            {"propertyName": "hubspot_owner_id", "operator": "EQ", "value": LUCAS},
+            {"propertyName": "hs_task_status", "operator": "NEQ", "value": "COMPLETED"}]}],
+            "properties": ["hs_task_subject", "hs_task_priority", "hs_timestamp", "hs_createdate"], "limit": 100}
+        if after: b["after"] = after
+        st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/tasks/search", b)
+        tasks += d.get("results", [])
+        after = d.get("paging", {}).get("next", {}).get("after")
+        if not after: break
+        time.sleep(0.2)
+    managed = [t for t in tasks if (t["properties"].get("hs_task_subject") or "").strip().lower().startswith(MANAGED_SUBJECTS)]
+
+    def mel_date_of(ts):
+        if not ts: return None
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return dt.astimezone(ZoneInfo("Australia/Melbourne")).date()
+
+    updates = []
+    park, pool, due_today = [], [], []
+    for t in managed:
+        subj = (t["properties"].get("hs_task_subject") or "").lower()
+        if subj.startswith("enrich first"):
+            park.append(t); continue
+        if mel_date_of(t["properties"].get("hs_timestamp")) == today:
+            due_today.append(t)
+        else:
+            pool.append(t)
+
+    # park enrich-first a rolling week out
+    park_date = today + timedelta(days=7)
+    for t in park:
+        if mel_date_of(t["properties"].get("hs_timestamp")) != park_date:
+            updates.append({"id": t["id"], "properties": {"hs_timestamp": _mel_due_ts(park_date)}})
+
+    # deal the pool: priority rank, then oldest created first
+    RANK = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+    pool.sort(key=lambda t: (RANK.get(t["properties"].get("hs_task_priority"), 3),
+                             t["properties"].get("hs_createdate") or ""))
+    slots_today = max(RATION_PER_DAY - len(due_today), 0)
+    day, filled = today, len(due_today)
+    for t in pool:
+        if filled >= RATION_PER_DAY:
+            day = day + timedelta(days=1); filled = 0
+        target = day if (day != today or slots_today > 0) else today + timedelta(days=1)
+        if day == today and slots_today <= 0:
+            day = today + timedelta(days=1); filled = 0; target = day
+        if mel_date_of(t["properties"].get("hs_timestamp")) != target:
+            updates.append({"id": t["id"], "properties": {"hs_timestamp": _mel_due_ts(target)}})
+        filled += 1
+        if day == today: slots_today -= 1
+    if COMMIT:
+        for i in range(0, len(updates), 100):
+            req("POST", "https://api.hubapi.com/crm/v3/objects/tasks/batch/update", {"inputs": updates[i:i+100]})
+            time.sleep(0.3)
+    print(f"task rationer: {len(managed)} managed ({len(due_today)} already today, {len(pool)} pooled, {len(park)} parked), {len(updates)} due dates set, ration {RATION_PER_DAY}/day" + ("" if COMMIT else " [dry-run]"))
+
+
 def normalize_phones(recs):
     """AU numbers stored without +61 (bare 1300/1800, 04 mobiles, 0x landlines) are
     unparseable by HubSpot, which breaks click-to-call. Normalize to E.164 hourly."""
@@ -424,6 +501,7 @@ def main():
     stamp_deal_sources()
     stamp_deal_amounts()
     groom_lucas_tasks()
+    ration_lucas_tasks()
     fix_call_owners()
 
 if __name__ == "__main__":
