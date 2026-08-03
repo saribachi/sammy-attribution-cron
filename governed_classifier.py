@@ -263,6 +263,10 @@ def groom_lucas_tasks():
         # and the anonymized email can never be waterfall-enriched (Chris, Jul 28)
         if email.endswith("@privaterelay.appleid.com") and not has_phone:
             archives.append(t["id"]); continue
+        # internal, test, and vendor addresses are never sales calls (Aug 3)
+        if email.endswith(("@withsammy.ai", ".withsammy.ai", "@paintmelbourne.com",
+                           "ghostinspector.com")) or email.endswith("@linkedin.com"):
+            archives.append(t["id"]); continue
         if status == "active_trial":            subject, prio = f"Trial convert: {name}", "HIGH"
         elif status == "trial_expired":         subject, prio = f"Winback: {name}", "MEDIUM"
         elif status == "free":                  subject, prio = f"Upgrade call: {name}", "MEDIUM"
