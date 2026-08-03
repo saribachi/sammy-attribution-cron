@@ -7,4 +7,8 @@ while True:
         subprocess.run([sys.executable, "governed_classifier.py", "--commit"], check=False)
     except Exception as e:
         print("run error:", e, flush=True)
+    try:
+        subprocess.run([sys.executable, "weekly_sweep.py"], check=False)
+    except Exception as e:
+        print("sweep error:", e, flush=True)
     time.sleep(INTERVAL)
