@@ -82,6 +82,24 @@ def collect():
 
     c["clay_campaign"] = total([{"propertyName": "cold_email_reply_campaign", "operator": "HAS_PROPERTY"}])
 
+    # missing-data visibility: contacts created last 7d without a phone,
+    # grouped by creation source, so incomplete pipes stay visible (Chris, Aug 3)
+    d = req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/search", {
+        "filterGroups": [{"filters": [
+            {"propertyName": "createdate", "operator": "GTE", "value": week_ms},
+            {"propertyName": "hs_calculated_phone_number", "operator": "NOT_HAS_PROPERTY"},
+            {"propertyName": "phone", "operator": "NOT_HAS_PROPERTY"}]}],
+        "properties": ["hs_object_source_label", "hs_object_source_detail_1", "firstname"], "limit": 200})
+    srcs = {}
+    for r in d["results"]:
+        p = r["properties"]
+        key = (p.get("hs_object_source_detail_1") or p.get("hs_object_source_label") or "unknown source")
+        e = srcs.setdefault(key, {"n": 0, "nameless": 0})
+        e["n"] += 1
+        if not p.get("firstname"): e["nameless"] += 1
+    c["phoneless_new"] = d["total"]
+    c["phoneless_by_source"] = sorted(srcs.items(), key=lambda kv: -kv[1]["n"])
+
     # MRR computed directly (same formula as the dashboard and deal stamper) so
     # the sweep never depends on the dashboard cache being warm
     mrr = 0
@@ -128,6 +146,12 @@ def compose(c, prev):
               f"- Campaign visibility: {c['clay_campaign']} contacts carry a reply campaign",
               f"- Pricing integrity: all plans and promo codes recognized" if not (c["unknown_plans"] or c["unknown_promos"]) else "- Pricing integrity: SEE PROBLEMS",
               ]
+    if c.get("phoneless_new"):
+        lines += ["", f"*Contacts created this week with NO phone: {c['phoneless_new']}*"]
+        for src, e in c["phoneless_by_source"][:6]:
+            lines.append(f"- {src}: {e['n']}" + (f" ({e['nameless']} also nameless)" if e["nameless"] else ""))
+        lines.append("These get no call task until a phone lands. Tighten the source or enrich.")
+
     lines += ["", "*Needs attention*"]
     if problems:
         lines += [f"{i+1}. {p}" for i, p in enumerate(problems)]
@@ -153,8 +177,8 @@ def maybe_weekly_sweep():
     now = datetime.now(timezone.utc)
     week = now.strftime("%G-W%V")
     done = open(MARKER).read().strip() if os.path.exists(MARKER) else ""
-    if done == week:
-        return
+    if done == week or os.environ.get("SWEEP_SKIP_WEEK") == week:
+        return  # already posted this week (marker, or env guard after a mid-week redeploy)
     if now.weekday() == 0 and now.hour < 15:
         return  # Monday before 8am Pacific: wait
     try:

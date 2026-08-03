@@ -273,7 +273,10 @@ def groom_lucas_tasks():
         elif status == "incomplete_onboarding": subject, prio = f"Onboarding nudge: {name}", "MEDIUM"
         elif status:                            subject, prio = f"Check in: {name}", "MEDIUM"
         elif has_phone:                         subject, prio = f"Cold call: {name}", "MEDIUM"
-        else:                                   subject, prio = f"Enrich first (no phone): {name}", "LOW"
+        else:
+            # no phone = not a callable task; archived. create_ready_tasks()
+            # re-creates the task the hour a phone lands (Chris, Aug 3)
+            archives.append(t["id"]); continue
         p = t["properties"]
         if p.get("hs_task_subject") != subject or p.get("hs_task_priority") != prio:
             updates.append({"id": t["id"], "properties": {"hs_task_subject": subject, "hs_task_priority": prio}})
@@ -288,6 +291,55 @@ def groom_lucas_tasks():
 
 
 RATION_PER_DAY = int(os.environ.get("LUCAS_RATION_PER_DAY", "100"))  # matches rep dial target
+
+
+def create_ready_tasks():
+    """Contacts that gained a phone after their lead event get their call task
+    here (the workflow only enrolls once, at the event, and now requires a
+    phone). Guard rails: recent contacts only, zero existing task associations
+    (a closed task means Lucas already worked them), no paid/churned/internal."""
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+    cands, after = [], None
+    while True:
+        b = {"filterGroups": [{"filters": [
+            {"propertyName": "hs_calculated_phone_number", "operator": "HAS_PROPERTY"},
+            {"propertyName": "createdate", "operator": "GTE", "value": "2026-06-01T00:00:00Z"}]}],
+            "properties": ["email", "firstname", "lastname", "user_status"], "limit": 200}
+        if after: b["after"] = after
+        st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/search", b)
+        cands += d.get("results", [])
+        after = d.get("paging", {}).get("next", {}).get("after")
+        if not after: break
+        time.sleep(0.2)
+    cands = [c for c in cands if c["properties"].get("user_status") not in ("paid_customer", "churned")
+             and not any((c["properties"].get("email") or "").lower().startswith(p) for p in SYS_INBOX)
+             and not (c["properties"].get("email") or "").lower().endswith(
+                 ("withsammy.ai", "@paintmelbourne.com", "ghostinspector.com", "@linkedin.com", "@privaterelay.appleid.com"))]
+    untasked = []
+    for i in range(0, len(cands), 100):
+        st, a = req("POST", "https://api.hubapi.com/crm/v4/associations/contacts/tasks/batch/read",
+                    {"inputs": [{"id": c["id"]} for c in cands[i:i+100]]})
+        tasked = {str(r["from"]["id"]) for r in a.get("results", []) if r.get("to")}
+        untasked += [c for c in cands[i:i+100] if c["id"] not in tasked]
+        time.sleep(0.2)
+    untasked = untasked[:50]  # per-run cap
+    mel_tomorrow = datetime.now(ZoneInfo("Australia/Melbourne")).date() + timedelta(days=1)
+    due = (datetime(mel_tomorrow.year, mel_tomorrow.month, mel_tomorrow.day) - timedelta(days=1)).strftime("%Y-%m-%dT22:00:00Z")
+    made = 0
+    if COMMIT:
+        for c in untasked:
+            name = " ".join(x for x in (c["properties"].get("firstname"), c["properties"].get("lastname")) if x) or c["properties"].get("email") or "contact"
+            req("POST", "https://api.hubapi.com/crm/v3/objects/tasks", {
+                "properties": {"hs_task_subject": f"Cold call: {name}", "hs_task_priority": "MEDIUM",
+                               "hs_task_status": "NOT_STARTED", "hs_task_type": "CALL",
+                               "hs_timestamp": due, "hubspot_owner_id": LUCAS},
+                "associations": [{"to": {"id": c["id"]},
+                                  "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 204}]}]})
+            made += 1
+            time.sleep(0.15)
+    print(f"ready-task creator: {len(cands)} phone-known recent contacts, {len(untasked)} untasked -> {made} tasks created" + ("" if COMMIT else " [dry-run]"))
+
 
 
 def _mel_due_ts(mel_date):
@@ -506,6 +558,7 @@ def main():
     stamp_deal_amounts()
     groom_lucas_tasks()
     ration_lucas_tasks()
+    create_ready_tasks()
     fix_call_owners()
 
 if __name__ == "__main__":
