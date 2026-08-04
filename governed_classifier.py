@@ -243,6 +243,75 @@ def stamp_became_paid():
     print(f"became-paid stamper: {len(ids)} unstamped paid customers, {len(updates)} stamped from history" + ("" if COMMIT else " [dry-run]"))
 
 
+def reconcile_deals():
+    """Invariant: every paid customer has a WON deal at least as new as their
+    latest conversion (became_paid_customer_date). The native mover workflow
+    cannot re-enroll and predates many customers, so deals drift from reality.
+    No deal -> create a won deal. Open-but-never-won (or re-conversion newer
+    than any won) -> move the newest open deal to won. Duplicate open deals
+    alongside a current won deal are left alone (human decision). Chris, Aug 4:
+    deals must represent contacts that convert."""
+    WON = "decisionmakerboughtin"
+    paid, after = [], None
+    while True:
+        b = {"filterGroups": [{"filters": [{"propertyName": "user_status", "operator": "EQ", "value": "paid_customer"}]}],
+             "properties": ["email", "firstname", "lastname", "became_paid_customer_date", "sammy_pricing_plan", "sammy_promo_code", "hubspot_owner_id"],
+             "limit": 200}
+        if after: b["after"] = after
+        st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/search", b)
+        paid += d.get("results", [])
+        after = d.get("paging", {}).get("next", {}).get("after")
+        if not after: break
+        time.sleep(0.2)
+    created = moved = dups = 0
+    for c in paid:
+        p = c["properties"]
+        became = p.get("became_paid_customer_date") or ""
+        st, a = req("GET", f"https://api.hubapi.com/crm/v4/objects/contacts/{c['id']}/associations/deals")
+        dids = [str(x["toObjectId"]) for x in a.get("results", [])]
+        won_current, open_deals, has_won = False, [], False
+        if dids:
+            st, dd = req("POST", "https://api.hubapi.com/crm/v3/objects/deals/batch/read",
+                         {"inputs": [{"id": i} for i in dids],
+                          "properties": ["dealstage", "hs_v2_date_entered_decisionmakerboughtin", "hs_createdate"]})
+            for r in dd.get("results", []):
+                stg = r["properties"].get("dealstage")
+                if stg == WON:
+                    has_won = True
+                    if (r["properties"].get("hs_v2_date_entered_decisionmakerboughtin") or "") >= became:
+                        won_current = True
+                elif stg != "closedlost":
+                    open_deals.append(r)
+        if won_current:
+            if open_deals: dups += 1
+            time.sleep(0.1); continue
+        amount = PLAN_AMOUNT.get(p.get("sammy_pricing_plan"), 59)
+        if p.get("sammy_promo_code") in PROMO_MONTHLY_DISCOUNT:
+            amount = max(amount - PROMO_MONTHLY_DISCOUNT[p.get("sammy_promo_code")], 0)
+        if COMMIT:
+            if open_deals:
+                open_deals.sort(key=lambda r: r["properties"].get("hs_createdate") or "", reverse=True)
+                body = {"properties": {"dealstage": WON}}
+                if became: body["properties"]["closedate"] = became
+                req("PATCH", f"https://api.hubapi.com/crm/v3/objects/deals/{open_deals[0]['id']}", body)
+                moved += 1
+            else:
+                name = " ".join(x for x in (p.get("firstname"), p.get("lastname")) if x) or p.get("email") or "customer"
+                body = {"properties": {"dealname": f"{name} - Sammy subscription", "dealstage": WON,
+                                       "pipeline": "default", "amount": str(amount)},
+                        "associations": [{"to": {"id": c["id"]},
+                                          "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 3}]}]}
+                if became: body["properties"]["closedate"] = became
+                if p.get("hubspot_owner_id"): body["properties"]["hubspot_owner_id"] = p.get("hubspot_owner_id")
+                req("POST", "https://api.hubapi.com/crm/v3/objects/deals", body)
+                created += 1
+        else:
+            if open_deals: moved += 1
+            else: created += 1
+        time.sleep(0.15)
+    print(f"deal reconciler: {len(paid)} paid customers, {moved} open deals moved to won, {created} won deals created, {dups} with duplicate open deals (untouched)" + ("" if COMMIT else " [dry-run]"))
+
+
 def groom_lucas_tasks():
     """Rename + reprioritize Lucas's open auto-tasks by what the contact IS now.
     paid/churned contacts: task archived (Chris's standing rule, Jul 28).
@@ -588,6 +657,7 @@ def main():
     stamp_deal_sources()
     stamp_deal_amounts()
     stamp_became_paid()
+    reconcile_deals()
     groom_lucas_tasks()
     ration_lucas_tasks()
     create_ready_tasks()
