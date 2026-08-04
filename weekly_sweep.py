@@ -81,6 +81,9 @@ def collect():
     c["unknown_promos"] = sorted({p["properties"].get("sammy_promo_code") for p in paid} - PROMO_VALUES - {None})
 
     c["clay_campaign"] = total([{"propertyName": "cold_email_reply_campaign", "operator": "HAS_PROPERTY"}])
+    c["paid_dated"] = total([{"propertyName": "user_status", "operator": "EQ", "value": "paid_customer"},
+                             {"propertyName": "became_paid_customer_date", "operator": "HAS_PROPERTY"}])
+    c["closed_on_call_total"] = total([{"propertyName": "closed_on_call", "operator": "EQ", "value": "true"}])
 
     # missing-data visibility: contacts created last 7d without a phone,
     # grouped by creation source, so incomplete pipes stay visible (Chris, Aug 3)
@@ -139,6 +142,7 @@ def compose(c, prev):
     day = datetime.now(timezone.utc).strftime("%A %B %-d")
     problems = []
     if c["blank_channel"]: problems.append(f"{c['blank_channel']} contacts have no source channel (expected 0)")
+    if c["paid_dated"] < c["paid"]: problems.append(f"{c['paid'] - c['paid_dated']} paying customers missing a conversion date (stamper gap)")
     if c["webhook_sysinbox"]: problems.append(f"{c['webhook_sysinbox']} system-inbox contacts leaked in this week")
     if c["unknown_plans"]: problems.append(f"UNRECOGNIZED PRICING PLAN(S): {c['unknown_plans']} - dashboard and deal pricing maps need updating")
     if c["unknown_promos"]: problems.append(f"UNRECOGNIZED PROMO CODE(S): {c['unknown_promos']} - discount mapping needed or MRR will drift")
@@ -159,6 +163,7 @@ def compose(c, prev):
               f"- New webhook contacts this week: {c['webhook_new']} ({c['webhook_nameless']} without names, {c['webhook_sysinbox']} system inboxes)",
               f"- Deals: {c['deals'] - c['deals_no_source']} of {c['deals']} have a source; {c['deals_no_amount']} blank amounts (free/no-plan contacts)",
               f"- Campaign visibility: {c['clay_campaign']} contacts carry a reply campaign",
+              f"- Sales tracking: {c['paid_dated']} of {c['paid']} paying customers have an exact conversion date; {c['closed_on_call_total']} all-time same-day demo closes",
               f"- Pricing integrity: all plans and promo codes recognized" if not (c["unknown_plans"] or c["unknown_promos"]) else "- Pricing integrity: SEE PROBLEMS",
               ]
     if c.get("phoneless_new"):
@@ -172,6 +177,10 @@ def compose(c, prev):
         lines += [f"{i+1}. {p}" for i, p in enumerate(problems)]
     else:
         lines.append("Nothing. All checks green.")
+    if os.path.exists("NEW_THIS_WEEK.md"):
+        items = [l.strip() for l in open("NEW_THIS_WEEK.md") if l.strip().startswith("-")]
+        if items:
+            lines += ["", "*New since last sweep*"] + items
     if os.path.exists("OUTSTANDING.md"):
         items = [l.strip() for l in open("OUTSTANDING.md") if l.strip().startswith("-")]
         if items:

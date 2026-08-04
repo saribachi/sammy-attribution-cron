@@ -4,5 +4,6 @@
 - Chris: coolify.hirecharm.com DNS is dead (server fine via IP)
 - Chris: restore deals write + lists write scopes on the working key, or issue the new key
 - Jared: phone numbers in +61 format at app signup
-- Krishna/Neha: Clay phone enrichment for the 93 parked no-phone contacts (CSV delivered)
+- Krishna/Neha: Clay enrichment recovered 32 phone numbers (now in the call queue); remaining ~60 are long shots, park or retry monthly
 - Lucas: report recurring follow-up scenarios so those tasks can be automated
+- Lucas: clear the backlog of past meetings still marked Scheduled or unmarked (unmarked completed demos do not count toward closed-on-call)
