@@ -320,6 +320,67 @@ def reconcile_deals():
     print(f"deal reconciler: {len(paid)} paid, sales-won moved {moved}, created {created}, sales dupes closed lost {deduped}, onboarding dupes (logged only) {ob_dupes}" + ("" if COMMIT else " [dry-run]"))
 
 
+def stamp_closed_on_call():
+    """closed_on_call = became a paying customer the SAME Melbourne day as a
+    completed meeting with Lucas. Cross-object comparison HubSpot calculated
+    properties cannot do; recomputed hourly so late-marked meeting outcomes
+    upgrade false -> true (Chris, Aug 5)."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    MEL = ZoneInfo("Australia/Melbourne")
+    def mel_day(ts):
+        if not ts: return None
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(MEL).date()
+
+    paid, after = [], None
+    while True:
+        b = {"filterGroups": [{"filters": [
+            {"propertyName": "user_status", "operator": "EQ", "value": "paid_customer"},
+            {"propertyName": "became_paid_customer_date", "operator": "HAS_PROPERTY"}]}],
+            "properties": ["became_paid_customer_date", "closed_on_call"], "limit": 200}
+        if after: b["after"] = after
+        st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/search", b)
+        paid += d.get("results", [])
+        after = d.get("paging", {}).get("next", {}).get("after")
+        if not after: break
+        time.sleep(0.2)
+
+    # contact -> meeting associations in batch
+    assoc = {}
+    for i in range(0, len(paid), 100):
+        st, a = req("POST", "https://api.hubapi.com/crm/v4/associations/contacts/meetings/batch/read",
+                    {"inputs": [{"id": c["id"]} for c in paid[i:i+100]]})
+        for r in a.get("results", []):
+            assoc[str(r["from"]["id"])] = [str(t["toObjectId"]) for t in r.get("to", [])]
+        time.sleep(0.2)
+    mids = sorted({m for v in assoc.values() for m in v})
+    minfo = {}
+    for i in range(0, len(mids), 100):
+        st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/meetings/batch/read",
+                    {"inputs": [{"id": x} for x in mids[i:i+100]],
+                     "properties": ["hs_meeting_outcome", "hubspot_owner_id", "hs_timestamp"]})
+        for r in d.get("results", []): minfo[r["id"]] = r["properties"]
+        time.sleep(0.2)
+
+    updates = []
+    for c in paid:
+        paid_day = mel_day(c["properties"].get("became_paid_customer_date"))
+        val = "false"
+        for mid in assoc.get(c["id"], []):
+            m = minfo.get(mid) or {}
+            if (m.get("hs_meeting_outcome") == "COMPLETED" and m.get("hubspot_owner_id") == LUCAS
+                    and mel_day(m.get("hs_timestamp")) == paid_day):
+                val = "true"; break
+        if (c["properties"].get("closed_on_call") or "") != val:
+            updates.append({"id": c["id"], "properties": {"closed_on_call": val}})
+    if COMMIT:
+        for i in range(0, len(updates), 100):
+            req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/batch/update", {"inputs": updates[i:i+100]})
+            time.sleep(0.3)
+    trues = sum(1 for u in updates if u["properties"]["closed_on_call"] == "true")
+    print(f"closed-on-call stamper: {len(paid)} paid checked, {len(updates)} updated ({trues} set true this run)" + ("" if COMMIT else " [dry-run]"))
+
+
 def groom_lucas_tasks():
     """Rename + reprioritize Lucas's open auto-tasks by what the contact IS now.
     paid/churned contacts: task archived (Chris's standing rule, Jul 28).
@@ -665,6 +726,7 @@ def main():
     stamp_deal_sources()
     stamp_deal_amounts()
     stamp_became_paid()
+    stamp_closed_on_call()
     reconcile_deals()
     groom_lucas_tasks()
     ration_lucas_tasks()
