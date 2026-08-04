@@ -381,6 +381,31 @@ def stamp_closed_on_call():
     print(f"closed-on-call stamper: {len(paid)} paid checked, {len(updates)} updated ({trues} set true this run)" + ("" if COMMIT else " [dry-run]"))
 
 
+def stamp_demo_meetings():
+    """is_demo = true on every scheduler-booked (Meetings Public) Lucas meeting
+    missing the flag. Native Call and Meeting Types tab is unavailable in this
+    portal, so this custom property is the demo marker (Chris, Aug 5). Hourly
+    so new bookings self-tag within the hour."""
+    ids, after = [], None
+    while True:
+        b = {"filterGroups": [{"filters": [
+            {"propertyName": "hubspot_owner_id", "operator": "EQ", "value": LUCAS},
+            {"propertyName": "hs_meeting_source", "operator": "EQ", "value": "MEETINGS_PUBLIC"},
+            {"propertyName": "is_demo", "operator": "NOT_HAS_PROPERTY"}]}], "limit": 100}
+        if after: b["after"] = after
+        st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/meetings/search", b)
+        ids += [r["id"] for r in d.get("results", [])]
+        after = d.get("paging", {}).get("next", {}).get("after")
+        if not after: break
+        time.sleep(0.2)
+    if COMMIT:
+        for i in range(0, len(ids), 100):
+            req("POST", "https://api.hubapi.com/crm/v3/objects/meetings/batch/update",
+                {"inputs": [{"id": x, "properties": {"is_demo": "true"}} for x in ids[i:i+100]]})
+            time.sleep(0.3)
+    print(f"demo stamper: {len(ids)} new scheduler meetings tagged is_demo" + ("" if COMMIT else " [dry-run]"))
+
+
 def groom_lucas_tasks():
     """Rename + reprioritize Lucas's open auto-tasks by what the contact IS now.
     paid/churned contacts: task archived (Chris's standing rule, Jul 28).
@@ -727,6 +752,7 @@ def main():
     stamp_deal_amounts()
     stamp_became_paid()
     stamp_closed_on_call()
+    stamp_demo_meetings()
     reconcile_deals()
     groom_lucas_tasks()
     ration_lucas_tasks()
