@@ -100,6 +100,20 @@ def collect():
     c["phoneless_new"] = d["total"]
     c["phoneless_by_source"] = sorted(srcs.items(), key=lambda kv: -kv[1]["n"])
 
+    # stale meeting outcomes: meetings that already happened but still say
+    # Scheduled or have no outcome (Chris's rule: impossible state, Aug 4)
+    now_ms = str(int(time.time() * 1000))
+    month_ago = str(int((time.time() - 30 * 86400) * 1000))
+    stale = 0
+    for f in ([{"propertyName": "hs_meeting_outcome", "operator": "EQ", "value": "SCHEDULED"}],
+              [{"propertyName": "hs_meeting_outcome", "operator": "NOT_HAS_PROPERTY"}]):
+        d = req("POST", "https://api.hubapi.com/crm/v3/objects/meetings/search", {
+            "filterGroups": [{"filters": [
+                {"propertyName": "hs_timestamp", "operator": "BETWEEN", "value": month_ago, "highValue": now_ms}] + f}],
+            "limit": 1})
+        stale += d["total"]
+    c["stale_meetings"] = stale
+
     # MRR computed directly (same formula as the dashboard and deal stamper) so
     # the sweep never depends on the dashboard cache being warm
     mrr = 0
@@ -130,6 +144,7 @@ def compose(c, prev):
     if c["unknown_promos"]: problems.append(f"UNRECOGNIZED PROMO CODE(S): {c['unknown_promos']} - discount mapping needed or MRR will drift")
     if not c["dash_ok"]: problems.append("attribution.hirecharm.com is not returning all report sections")
     if c["deals_no_amount"] > 300: problems.append(f"blank deal amounts grew to {c['deals_no_amount']} (baseline ~248)")
+    if c.get("stale_meetings"): problems.append(f"{c['stale_meetings']} past meetings (30d) still say Scheduled or have no outcome - outcomes not being updated, ask the rep to mark them")
 
     lines = [f"*Sammy Weekly Sweep: {day}*", ""]
     if prev:
