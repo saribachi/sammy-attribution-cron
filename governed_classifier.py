@@ -212,6 +212,37 @@ MANAGED_SUBJECTS = ("call this lead immediately", "call new lead", "follow up wi
 SYS_INBOX = ("support@", "noreply@", "no-reply@", "notifications@", "postmaster@", "mailer-daemon@", "help@")
 
 
+def stamp_became_paid():
+    """Contacts newly flipped to paid_customer get became_paid_customer_date
+    stamped from user_status history (exact transition moment). Write-once;
+    contact-object source of truth for sales counting (Chris, Aug 4)."""
+    ids, after = [], None
+    while True:
+        b = {"filterGroups": [{"filters": [
+            {"propertyName": "user_status", "operator": "EQ", "value": "paid_customer"},
+            {"propertyName": "became_paid_customer_date", "operator": "NOT_HAS_PROPERTY"}]}], "limit": 100}
+        if after: b["after"] = after
+        st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/search", b)
+        ids += [r["id"] for r in d.get("results", [])]
+        after = d.get("paging", {}).get("next", {}).get("after")
+        if not after: break
+        time.sleep(0.2)
+    updates = []
+    for i in range(0, len(ids), 50):
+        st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/batch/read",
+                    {"inputs": [{"id": x} for x in ids[i:i+50]], "propertiesWithHistory": ["user_status"]})
+        for r in d.get("results", []):
+            vers = (r.get("propertiesWithHistory", {}).get("user_status") or [])
+            ts = next((v["timestamp"] for v in vers if v.get("value") == "paid_customer"), None)
+            if ts: updates.append({"id": r["id"], "properties": {"became_paid_customer_date": ts}})
+        time.sleep(0.2)
+    if COMMIT:
+        for i in range(0, len(updates), 100):
+            req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/batch/update", {"inputs": updates[i:i+100]})
+            time.sleep(0.3)
+    print(f"became-paid stamper: {len(ids)} unstamped paid customers, {len(updates)} stamped from history" + ("" if COMMIT else " [dry-run]"))
+
+
 def groom_lucas_tasks():
     """Rename + reprioritize Lucas's open auto-tasks by what the contact IS now.
     paid/churned contacts: task archived (Chris's standing rule, Jul 28).
@@ -556,6 +587,7 @@ def main():
     normalize_phones(recs)
     stamp_deal_sources()
     stamp_deal_amounts()
+    stamp_became_paid()
     groom_lucas_tasks()
     ration_lucas_tasks()
     create_ready_tasks()
