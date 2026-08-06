@@ -8,3 +8,6 @@
 - Week convention unified: all surfaces use HubSpot's Sunday-start weeks in Melbourne time.
 - Task system: no call tasks are created without a phone number; tasks appear automatically the hour a phone number lands; queue deals Lucas 100 tasks per day.
 - Meeting hygiene rule live: past meetings still marked Scheduled or unmarked are flagged in this sweep (53 found at rollout, Lucas clearing).
+- Data accuracy fix (Lucas caught this): the "new paying customers this week" count was overstated because contact merges and system re-syncs were re-dating old customers into the current week. Fixed so the conversion date is the first real time someone became a customer; 62 dates corrected. This week's list now matches what the team actually closed.
+- Conversion dates now also kept for customers who later churned, so past weeks' sales numbers stay accurate in history instead of dropping off when someone leaves.
+- New automated guardrail: contact merges can silently overwrite attribution and conversion data (they bypass normal protections). An hourly check now detects and reverts any merge that changes a source channel, and corrects any re-dated conversion. 5 mis-attributed customers were restored this week.

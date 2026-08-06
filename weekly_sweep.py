@@ -84,6 +84,12 @@ def collect():
     c["paid_dated"] = total([{"propertyName": "user_status", "operator": "EQ", "value": "paid_customer"},
                              {"propertyName": "became_paid_customer_date", "operator": "HAS_PROPERTY"}])
     c["closed_on_call_total"] = total([{"propertyName": "closed_on_call", "operator": "EQ", "value": "true"}])
+    # merge-integrity spot check: paid customers whose became_paid date sits in
+    # the current week but whose latest status write was a merge (would signal
+    # the guard is not keeping up)
+    import time as _t
+    wk_start = str(int((_t.time() - (_t.time() % 604800)) * 1000))
+    c["paid_future"] = total([{"propertyName": "became_paid_customer_date", "operator": "GT", "value": str(int(_t.time() * 1000))}])
 
     # missing-data visibility: contacts created last 7d without a phone,
     # grouped by creation source, so incomplete pipes stay visible (Chris, Aug 3)
@@ -143,6 +149,7 @@ def compose(c, prev):
     problems = []
     if c["blank_channel"]: problems.append(f"{c['blank_channel']} contacts have no source channel (expected 0)")
     if c["paid_dated"] < c["paid"]: problems.append(f"{c['paid'] - c['paid_dated']} paying customers missing a conversion date (stamper gap)")
+    if c.get("paid_future"): problems.append(f"{c['paid_future']} conversions dated in the future - merge or clock artifact, investigate")
     if c["webhook_sysinbox"]: problems.append(f"{c['webhook_sysinbox']} system-inbox contacts leaked in this week")
     if c["unknown_plans"]: problems.append(f"UNRECOGNIZED PRICING PLAN(S): {c['unknown_plans']} - dashboard and deal pricing maps need updating")
     if c["unknown_promos"]: problems.append(f"UNRECOGNIZED PROMO CODE(S): {c['unknown_promos']} - discount mapping needed or MRR will drift")
@@ -164,6 +171,7 @@ def compose(c, prev):
               f"- Deals: {c['deals'] - c['deals_no_source']} of {c['deals']} have a source; {c['deals_no_amount']} blank amounts (free/no-plan contacts)",
               f"- Campaign visibility: {c['clay_campaign']} contacts carry a reply campaign",
               f"- Sales tracking: {c['paid_dated']} of {c['paid']} paying customers have an exact conversion date; {c['closed_on_call_total']} all-time same-day demo closes",
+              f"- Data integrity: conversion dates reflect first real conversion (merge/re-sync artifacts filtered); {c['paid_future']} future-dated (expect 0)",
               f"- Pricing integrity: all plans and promo codes recognized" if not (c["unknown_plans"] or c["unknown_promos"]) else "- Pricing integrity: SEE PROBLEMS",
               ]
     if c.get("phoneless_new"):
