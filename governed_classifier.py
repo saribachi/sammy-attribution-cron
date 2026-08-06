@@ -380,6 +380,63 @@ def guard_merge_overwrites():
 KRISHNA = "162267743"
 SAMMY_BOT = "162258278"
 
+def stamp_demo_reminder_time():
+    """next_lucas_demo_time = start of the contact's soonest UPCOMING is_demo
+    meeting (Lucas's scheduling link). Enrollment source for the pre-demo SMS
+    workflow; populated ONLY for Lucas demos so reminders never fire for other
+    meeting activity. Recomputed hourly: reflects the next demo, clears when none
+    upcoming so a later booking re-triggers enrollment."""
+    from datetime import datetime, timezone
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # upcoming demo meetings
+    meetings, after = [], None
+    while True:
+        b = {"filterGroups": [{"filters": [
+            {"propertyName": "is_demo", "operator": "EQ", "value": "true"},
+            {"propertyName": "hs_meeting_start_time", "operator": "GT", "value": now_iso}]}],
+            "properties": ["hs_meeting_start_time"], "limit": 100}
+        if after: b["after"] = after
+        st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/meetings/search", b)
+        meetings += d.get("results", [])
+        after = d.get("paging", {}).get("next", {}).get("after")
+        if not after: break
+        time.sleep(0.2)
+    # soonest upcoming demo per contact
+    want = {}
+    for m in meetings:
+        st = m["properties"].get("hs_meeting_start_time")
+        sta, a = req("GET", f"https://api.hubapi.com/crm/v4/objects/meetings/{m['id']}/associations/contacts")
+        for c in (a.get("results") or []):
+            cid = str(c["toObjectId"])
+            if cid not in want or st < want[cid]:
+                want[cid] = st
+        time.sleep(0.1)
+    # current holders of the property (to clear stale ones)
+    holders, after = set(), None
+    while True:
+        b = {"filterGroups": [{"filters": [{"propertyName": "next_lucas_demo_time", "operator": "HAS_PROPERTY"}]}],
+             "properties": ["next_lucas_demo_time"], "limit": 100}
+        if after: b["after"] = after
+        st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/search", b)
+        for r in d.get("results", []): holders.add((r["id"], r["properties"].get("next_lucas_demo_time")))
+        after = d.get("paging", {}).get("next", {}).get("after")
+        if not after: break
+        time.sleep(0.2)
+    updates = []
+    for cid, st in want.items():
+        cur = dict(holders).get(cid)
+        if cur != st:
+            updates.append({"id": cid, "properties": {"next_lucas_demo_time": st}})
+    for cid, cur in holders:
+        if cid not in want:  # demo passed / gone -> clear
+            updates.append({"id": cid, "properties": {"next_lucas_demo_time": ""}})
+    if COMMIT:
+        for i in range(0, len(updates), 100):
+            req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/batch/update", {"inputs": updates[i:i+100]})
+            time.sleep(0.3)
+    print(f"demo reminder time: {len(meetings)} upcoming demos, {len(want)} contacts, {len(updates)} stamped/cleared" + ("" if COMMIT else " [dry-run]"))
+
+
 def route_tickets():
     """Support routing (Krishna's rule Aug 6): current customer tickets -> Krishna,
     everyone else (trial etc) -> Lucas. Routes by the associated contact's
@@ -805,6 +862,7 @@ def main():
     stamp_became_paid()
     stamp_closed_on_call()
     stamp_demo_meetings()
+    stamp_demo_reminder_time()
     guard_merge_overwrites()
     route_tickets()
     ticket_followups()
