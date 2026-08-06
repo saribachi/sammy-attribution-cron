@@ -377,6 +377,87 @@ def guard_merge_overwrites():
     print(f"merge guard: {len(ids)} recently modified scanned, {len(fixes)} merge-overwritten channels restored" + ("" if COMMIT else " [dry-run]"))
 
 
+KRISHNA = "162267743"
+SAMMY_BOT = "162258278"
+
+def route_tickets():
+    """Support routing (Krishna's rule Aug 6): current customer tickets -> Krishna,
+    everyone else (trial etc) -> Lucas. Routes by the associated contact's
+    user_status. Only reassigns tickets still owned by the bot or unassigned, so
+    manual reassignments and dev/founder escalations are never overridden. Open
+    tickets only; re-checks hourly so a trial->paid change reroutes."""
+    tickets, after = [], None
+    while True:
+        b = {"filterGroups": [{"filters": [
+            {"propertyName": "hs_pipeline_stage", "operator": "NEQ", "value": "4"}]}],
+            "properties": ["hubspot_owner_id"], "limit": 100}
+        if after: b["after"] = after
+        st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/tickets/search", b)
+        tickets += d.get("results", [])
+        after = d.get("paging", {}).get("next", {}).get("after")
+        if not after: break
+        time.sleep(0.2)
+    routable = [t for t in tickets if (t["properties"].get("hubspot_owner_id") or SAMMY_BOT) in (SAMMY_BOT, "")]
+    updates = []
+    for t in routable:
+        st, a = req("GET", f"https://api.hubapi.com/crm/v4/objects/tickets/{t['id']}/associations/contacts")
+        res = a.get("results") or []
+        if not res: continue
+        cid = str(res[0]["toObjectId"])
+        st, c = req("GET", f"https://api.hubapi.com/crm/v3/objects/contacts/{cid}?properties=user_status")
+        status = (c.get("properties", {}) if st == 200 else {}).get("user_status")
+        owner = KRISHNA if status == "paid_customer" else LUCAS
+        if t["properties"].get("hubspot_owner_id") != owner:
+            updates.append({"id": t["id"], "properties": {"hubspot_owner_id": owner}})
+        time.sleep(0.1)
+    if COMMIT:
+        for i in range(0, len(updates), 100):
+            req("POST", "https://api.hubapi.com/crm/v3/objects/tickets/batch/update", {"inputs": updates[i:i+100]})
+            time.sleep(0.3)
+    k = sum(1 for u in updates if u["properties"]["hubspot_owner_id"] == KRISHNA)
+    print(f"ticket router: {len(tickets)} open, {len(routable)} bot/unassigned, {len(updates)} routed ({k} Krishna, {len(updates)-k} Lucas)" + ("" if COMMIT else " [dry-run]"))
+
+
+def ticket_followups():
+    """When a ticket is Resolved, create a +2 day follow-up task for its owner to
+    confirm the issue stayed resolved (Krishna: 'we like to follow up'). Dedup via
+    followup_task_created; owned-by-bot resolved tickets get Krishna as default."""
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+    tickets, after = [], None
+    while True:
+        b = {"filterGroups": [{"filters": [
+            {"propertyName": "hs_pipeline_stage", "operator": "EQ", "value": "4"},
+            {"propertyName": "followup_task_created", "operator": "NOT_HAS_PROPERTY"},
+            {"propertyName": "hs_lastmodifieddate", "operator": "GTE", "value": str(int((time.time() - 3 * 86400) * 1000))}]}],
+            "properties": ["subject", "hubspot_owner_id"], "limit": 100}
+        if after: b["after"] = after
+        st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/tickets/search", b)
+        tickets += d.get("results", [])
+        after = d.get("paging", {}).get("next", {}).get("after")
+        if not after: break
+        time.sleep(0.2)
+    mel = ZoneInfo("Australia/Melbourne")
+    due_date = datetime.now(mel).date() + timedelta(days=2)
+    due = (datetime(due_date.year, due_date.month, due_date.day) - timedelta(days=1)).strftime("%Y-%m-%dT22:00:00Z")
+    made = 0
+    for t in tickets:
+        owner = t["properties"].get("hubspot_owner_id")
+        if owner in (None, "", SAMMY_BOT): owner = KRISHNA
+        subj = t["properties"].get("subject") or f"Ticket {t['id']}"
+        if COMMIT:
+            req("POST", "https://api.hubapi.com/crm/v3/objects/tasks", {
+                "properties": {"hs_task_subject": f"Confirm resolved: {subj}", "hs_task_priority": "MEDIUM",
+                               "hs_task_status": "NOT_STARTED", "hs_task_type": "TODO",
+                               "hs_timestamp": due, "hubspot_owner_id": owner},
+                "associations": [{"to": {"id": t["id"]},
+                                  "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 226}]}]})
+            req("PATCH", f"https://api.hubapi.com/crm/v3/objects/tickets/{t['id']}", {"properties": {"followup_task_created": "true"}})
+            made += 1
+        time.sleep(0.15)
+    print(f"ticket follow-ups: {len(tickets)} newly-resolved without a follow-up, {made} tasks created" + ("" if COMMIT else " [dry-run]"))
+
+
 def groom_lucas_tasks():
     """Rename + reprioritize Lucas's open auto-tasks by what the contact IS now.
     paid/churned contacts: task archived (Chris's standing rule, Jul 28).
@@ -725,6 +806,8 @@ def main():
     stamp_closed_on_call()
     stamp_demo_meetings()
     guard_merge_overwrites()
+    route_tickets()
+    ticket_followups()
     reconcile_deals()
     groom_lucas_tasks()
     ration_lucas_tasks()
