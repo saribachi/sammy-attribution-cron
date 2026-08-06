@@ -213,111 +213,45 @@ SYS_INBOX = ("support@", "noreply@", "no-reply@", "notifications@", "postmaster@
 
 
 def stamp_became_paid():
-    """Contacts newly flipped to paid_customer get became_paid_customer_date
-    stamped from user_status history (exact transition moment). Write-once;
-    contact-object source of truth for sales counting (Chris, Aug 4)."""
-    ids, after = [], None
+    """became_paid_customer_date = FIRST GENUINE transition into paid_customer.
+    Walk user_status history chronologically and count only real value CHANGES:
+    contact merges and sync re-writes log new versions with the same value and
+    must not move the date (Aug 5 fix after Lucas caught re-stamped closes).
+    Recomputes all paid customers hourly so drift self-corrects."""
+    contacts, after = [], None
     while True:
         b = {"filterGroups": [{"filters": [
-            {"propertyName": "user_status", "operator": "EQ", "value": "paid_customer"},
-            {"propertyName": "became_paid_customer_date", "operator": "NOT_HAS_PROPERTY"}]}], "limit": 100}
+            {"propertyName": "user_status", "operator": "EQ", "value": "paid_customer"}]}],
+            "limit": 100}
         if after: b["after"] = after
         st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/search", b)
-        ids += [r["id"] for r in d.get("results", [])]
+        contacts += d.get("results", [])
         after = d.get("paging", {}).get("next", {}).get("after")
         if not after: break
         time.sleep(0.2)
     updates = []
-    for i in range(0, len(ids), 50):
+    for i in range(0, len(contacts), 50):
         st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/batch/read",
-                    {"inputs": [{"id": x} for x in ids[i:i+50]], "propertiesWithHistory": ["user_status"]})
+                    {"inputs": [{"id": c["id"]} for c in contacts[i:i+50]],
+                     "properties": ["became_paid_customer_date"],
+                     "propertiesWithHistory": ["user_status"]})
         for r in d.get("results", []):
-            vers = (r.get("propertiesWithHistory", {}).get("user_status") or [])
-            ts = next((v["timestamp"] for v in vers if v.get("value") == "paid_customer"), None)
-            if ts: updates.append({"id": r["id"], "properties": {"became_paid_customer_date": ts}})
+            vers = list(reversed(r.get("propertiesWithHistory", {}).get("user_status") or []))  # oldest first
+            first_paid, prev = None, None
+            for v in vers:
+                val = v.get("value")
+                if val == "paid_customer" and prev != "paid_customer":
+                    first_paid = v["timestamp"]
+                    break  # first genuine entry into paid
+                prev = val
+            if first_paid and r["properties"].get("became_paid_customer_date") != first_paid:
+                updates.append({"id": r["id"], "properties": {"became_paid_customer_date": first_paid}})
         time.sleep(0.2)
     if COMMIT:
         for i in range(0, len(updates), 100):
             req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/batch/update", {"inputs": updates[i:i+100]})
             time.sleep(0.3)
-    print(f"became-paid stamper: {len(ids)} unstamped paid customers, {len(updates)} stamped from history" + ("" if COMMIT else " [dry-run]"))
-
-
-def reconcile_deals():
-    """SALES-PIPELINE-ONLY invariant + same-pipeline dedupe guardrail (Chris, Aug 4).
-    Rules:
-    - Legitimate pattern: one deal in Sales (default) + one in Onboarding (1970863853).
-    - Invariant: paid customer => a WON deal in the SALES pipeline at least as new
-      as became_paid_customer_date. Open sales deal moved to won, else created.
-      Onboarding/Partnership pipeline deals are NEVER touched.
-    - Guardrail: duplicate non-closed deals within the SALES pipeline: keep the
-      won one (or the oldest open), close the rest as lost with reason Duplicate.
-      Onboarding duplicates are counted and logged only (no lost stage there).
-    """
-    WON, SALES, ONBOARDING = "decisionmakerboughtin", "default", "1970863853"
-    paid, after = [], None
-    while True:
-        b = {"filterGroups": [{"filters": [{"propertyName": "user_status", "operator": "EQ", "value": "paid_customer"}]}],
-             "properties": ["email", "firstname", "lastname", "became_paid_customer_date", "sammy_pricing_plan", "sammy_promo_code", "hubspot_owner_id"],
-             "limit": 200}
-        if after: b["after"] = after
-        st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/search", b)
-        paid += d.get("results", [])
-        after = d.get("paging", {}).get("next", {}).get("after")
-        if not after: break
-        time.sleep(0.2)
-    created = moved = deduped = ob_dupes = 0
-    for c in paid:
-        p = c["properties"]
-        became = p.get("became_paid_customer_date") or ""
-        st, a = req("GET", f"https://api.hubapi.com/crm/v4/objects/contacts/{c['id']}/associations/deals")
-        dids = [str(x["toObjectId"]) for x in a.get("results", [])]
-        sales_won, sales_open, ob_active = [], [], []
-        if dids:
-            st, dd = req("POST", "https://api.hubapi.com/crm/v3/objects/deals/batch/read",
-                         {"inputs": [{"id": i} for i in dids],
-                          "properties": ["dealstage", "pipeline", "hs_v2_date_entered_decisionmakerboughtin", "hs_createdate"]})
-            for r in dd.get("results", []):
-                q = r["properties"]
-                if q.get("pipeline") == SALES:
-                    if q.get("dealstage") == WON: sales_won.append(r)
-                    elif q.get("dealstage") != "closedlost": sales_open.append(r)
-                elif q.get("pipeline") == ONBOARDING and q.get("dealstage") != "3118786252":
-                    ob_active.append(r)
-        if len(ob_active) > 1: ob_dupes += 1
-        won_current = any((r["properties"].get("hs_v2_date_entered_decisionmakerboughtin") or "") >= became for r in sales_won)
-        sales_open.sort(key=lambda r: r["properties"].get("hs_createdate") or "")
-        if COMMIT:
-            if not won_current:
-                if sales_open:
-                    keep = sales_open.pop(0)
-                    body = {"properties": {"dealstage": WON}}
-                    if became: body["properties"]["closedate"] = became
-                    req("PATCH", f"https://api.hubapi.com/crm/v3/objects/deals/{keep['id']}", body)
-                    moved += 1
-                else:
-                    amount = PLAN_AMOUNT.get(p.get("sammy_pricing_plan"), 59)
-                    if p.get("sammy_promo_code") in PROMO_MONTHLY_DISCOUNT:
-                        amount = max(amount - PROMO_MONTHLY_DISCOUNT[p.get("sammy_promo_code")], 0)
-                    name = " ".join(x for x in (p.get("firstname"), p.get("lastname")) if x) or p.get("email") or "customer"
-                    body = {"properties": {"dealname": f"{name} - Sammy subscription", "dealstage": WON,
-                                           "pipeline": SALES, "amount": str(amount)},
-                            "associations": [{"to": {"id": c["id"]},
-                                              "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 3}]}]}
-                    if became: body["properties"]["closedate"] = became
-                    if p.get("hubspot_owner_id"): body["properties"]["hubspot_owner_id"] = p.get("hubspot_owner_id")
-                    req("POST", "https://api.hubapi.com/crm/v3/objects/deals", body)
-                    created += 1
-            # remaining open sales deals are same-pipeline duplicates: close as lost
-            for r in sales_open:
-                req("PATCH", f"https://api.hubapi.com/crm/v3/objects/deals/{r['id']}",
-                    {"properties": {"dealstage": "closedlost", "closed_lost_reason": "Duplicate (auto: customer already has a current sales deal)"}})
-                deduped += 1
-        else:
-            if not won_current: moved += 1 if sales_open else 0; created += 0 if sales_open else 1
-            deduped += max(len(sales_open) - (0 if won_current else 1), 0)
-        time.sleep(0.15)
-    print(f"deal reconciler: {len(paid)} paid, sales-won moved {moved}, created {created}, sales dupes closed lost {deduped}, onboarding dupes (logged only) {ob_dupes}" + ("" if COMMIT else " [dry-run]"))
+    print(f"became-paid stamper: {len(contacts)} paid customers, {len(updates)} dates corrected to first genuine conversion" + ("" if COMMIT else " [dry-run]"))
 
 
 def stamp_closed_on_call():
