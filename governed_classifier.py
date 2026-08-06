@@ -221,7 +221,7 @@ def stamp_became_paid():
     contacts, after = [], None
     while True:
         b = {"filterGroups": [{"filters": [
-            {"propertyName": "user_status", "operator": "EQ", "value": "paid_customer"}]}],
+            {"propertyName": "user_status", "operator": "IN", "values": ["paid_customer", "churned"]}]}],
             "limit": 100}
         if after: b["after"] = after
         st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/search", b)
@@ -269,7 +269,7 @@ def stamp_closed_on_call():
     paid, after = [], None
     while True:
         b = {"filterGroups": [{"filters": [
-            {"propertyName": "user_status", "operator": "EQ", "value": "paid_customer"},
+            {"propertyName": "user_status", "operator": "IN", "values": ["paid_customer", "churned"]},
             {"propertyName": "became_paid_customer_date", "operator": "HAS_PROPERTY"}]}],
             "properties": ["became_paid_customer_date", "closed_on_call"], "limit": 200}
         if after: b["after"] = after
@@ -338,6 +338,43 @@ def stamp_demo_meetings():
                 {"inputs": [{"id": x, "properties": {"is_demo": "true"}} for x in ids[i:i+100]]})
             time.sleep(0.3)
     print(f"demo stamper: {len(ids)} new scheduler meetings tagged is_demo" + ("" if COMMIT else " [dry-run]"))
+
+
+def guard_merge_overwrites():
+    """Contact merges bypass write-once and can rewrite attribution channels
+    (found Aug 5: 5 contacts flipped). If the LATEST write to an attribution
+    property came from a merge AND changed the value, restore the pre-merge
+    value. Scans recently modified contacts each run."""
+    PROPS = ["original_source_channel", "person_original_channel"]
+    cutoff = str(int((time.time() - 3 * 86400) * 1000))
+    ids, after = [], None
+    while True:
+        b = {"filterGroups": [{"filters": [
+            {"propertyName": "lastmodifieddate", "operator": "GTE", "value": cutoff},
+            {"propertyName": "original_source_channel", "operator": "HAS_PROPERTY"}]}], "limit": 100}
+        if after: b["after"] = after
+        st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/search", b)
+        ids += [r["id"] for r in d.get("results", [])]
+        after = d.get("paging", {}).get("next", {}).get("after")
+        if not after: break
+        time.sleep(0.2)
+    fixes = []
+    for i in range(0, len(ids), 50):
+        st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/batch/read",
+                    {"inputs": [{"id": x} for x in ids[i:i+50]], "propertiesWithHistory": PROPS})
+        for r in d.get("results", []):
+            props = {}
+            for p in PROPS:
+                vers = r.get("propertiesWithHistory", {}).get(p) or []
+                if len(vers) >= 2 and vers[0].get("sourceType") == "MERGE_OBJECTS" and vers[0]["value"] != vers[1]["value"]:
+                    props[p] = vers[1]["value"]
+            if props: fixes.append({"id": r["id"], "properties": props})
+        time.sleep(0.2)
+    if COMMIT:
+        for i in range(0, len(fixes), 100):
+            req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/batch/update", {"inputs": fixes[i:i+100]})
+            time.sleep(0.3)
+    print(f"merge guard: {len(ids)} recently modified scanned, {len(fixes)} merge-overwritten channels restored" + ("" if COMMIT else " [dry-run]"))
 
 
 def groom_lucas_tasks():
@@ -687,6 +724,7 @@ def main():
     stamp_became_paid()
     stamp_closed_on_call()
     stamp_demo_meetings()
+    guard_merge_overwrites()
     reconcile_deals()
     groom_lucas_tasks()
     ration_lucas_tasks()
