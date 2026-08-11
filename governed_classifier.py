@@ -479,9 +479,9 @@ def ticket_followups():
     """When a ticket is Resolved, create a +2 day follow-up task for its owner to
     confirm the issue stayed resolved (Krishna: 'we like to follow up'). Dedup via
     followup_task_created; owned-by-bot resolved tickets get Krishna as default."""
-    from datetime import datetime, timedelta
+    from datetime import datetime, timedelta, timezone
     from zoneinfo import ZoneInfo
-    tickets, after = [], None
+    # Scan a rolling recent windowtickets, after = [], None
     while True:
         b = {"filterGroups": [{"filters": [
             {"propertyName": "hs_pipeline_stage", "operator": "EQ", "value": "4"},
@@ -601,14 +601,19 @@ def create_ready_tasks():
     here (the workflow only enrolls once, at the event, and now requires a
     phone). Guard rails: recent contacts only, zero existing task associations
     (a closed task means Lucas already worked them), no paid/churned/internal."""
-    from datetime import datetime, timedelta
+    from datetime import datetime, timedelta, timezone
     from zoneinfo import ZoneInfo
+    # Scan a rolling recent window# Scan a rolling recent window, NEWEST FIRST — not everything since June.
+    # The old all-since-June scan (600+) plus the 50/run cap let new leads get
+    # stuck behind a backlog and never tasked (Lucas flagged, Aug 11).
+    window = (datetime.now(timezone.utc) - timedelta(days=14)).strftime("%Y-%m-%dT%H:%M:%SZ")
     cands, after = [], None
     while True:
         b = {"filterGroups": [{"filters": [
             {"propertyName": "hs_calculated_phone_number", "operator": "HAS_PROPERTY"},
-            {"propertyName": "createdate", "operator": "GTE", "value": "2026-06-01T00:00:00Z"}]}],
-            "properties": ["email", "firstname", "lastname", "user_status"], "limit": 200}
+            {"propertyName": "createdate", "operator": "GTE", "value": window}]}],
+            "properties": ["email", "firstname", "lastname", "user_status"], "limit": 200,
+            "sorts": [{"propertyName": "createdate", "direction": "DESCENDING"}]}
         if after: b["after"] = after
         st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/search", b)
         cands += d.get("results", [])
@@ -626,7 +631,7 @@ def create_ready_tasks():
         tasked = {str(r["from"]["id"]) for r in a.get("results", []) if r.get("to")}
         untasked += [c for c in cands[i:i+100] if c["id"] not in tasked]
         time.sleep(0.2)
-    untasked = untasked[:50]  # per-run cap
+    untasked = untasked[:100]  # per-run cap (recent window keeps this small)
     mel_tomorrow = datetime.now(ZoneInfo("Australia/Melbourne")).date() + timedelta(days=1)
     due = (datetime(mel_tomorrow.year, mel_tomorrow.month, mel_tomorrow.day) - timedelta(days=1)).strftime("%Y-%m-%dT22:00:00Z")
     made = 0
@@ -656,9 +661,9 @@ def ration_lucas_tasks():
     """Deal Lucas a finishable day: up to RATION_PER_DAY managed tasks due today
     (Melbourne), remainder spread over following days by priority then age.
     Tasks already due today are never pushed out. Enrich-first parks +7 days."""
-    from datetime import datetime, timedelta
+    from datetime import datetime, timedelta, timezone
     from zoneinfo import ZoneInfo
-    today = datetime.now(ZoneInfo("Australia/Melbourne")).date()
+    # Scan a rolling recent windowtoday = datetime.now(ZoneInfo("Australia/Melbourne")).date()
 
     tasks, after = [], None
     while True:
