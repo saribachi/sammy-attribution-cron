@@ -207,12 +207,16 @@ def maybe_weekly_sweep():
         print("sweep: SLACK_WEBHOOK_URL not set, skipping", flush=True)
         return
     now = datetime.now(timezone.utc)
+    # ONLY post on Mondays, at/after 15:00 UTC (8am US Pacific). Hard weekday gate
+    # so a mid-week redeploy can never trigger a post: the marker lives in /tmp and
+    # is wiped on redeploy, which previously made the once-per-week check re-fire on
+    # every ship. The weekday gate makes that impossible outside Monday.
+    if now.weekday() != 0 or now.hour < 15:
+        return
     week = now.strftime("%G-W%V")
     done = open(MARKER).read().strip() if os.path.exists(MARKER) else ""
     if done == week or os.environ.get("SWEEP_SKIP_WEEK") == week:
-        return  # already posted this week (marker, or env guard after a mid-week redeploy)
-    if now.weekday() == 0 and now.hour < 15:
-        return  # Monday before 8am Pacific: wait
+        return  # already posted this week (marker, or env guard for a Monday-afternoon redeploy)
     try:
         c = collect()
         prev = json.load(open(BASELINE)) if os.path.exists(BASELINE) else None
