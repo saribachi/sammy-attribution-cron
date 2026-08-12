@@ -612,7 +612,7 @@ def create_ready_tasks():
         b = {"filterGroups": [{"filters": [
             {"propertyName": "hs_calculated_phone_number", "operator": "HAS_PROPERTY"},
             {"propertyName": "createdate", "operator": "GTE", "value": window}]}],
-            "properties": ["email", "firstname", "lastname", "user_status"], "limit": 200,
+            "properties": ["email", "firstname", "lastname", "user_status", "hs_object_source_detail_1"], "limit": 200,
             "sorts": [{"propertyName": "createdate", "direction": "DESCENDING"}]}
         if after: b["after"] = after
         st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/search", b)
@@ -621,6 +621,7 @@ def create_ready_tasks():
         if not after: break
         time.sleep(0.2)
     cands = [c for c in cands if c["properties"].get("user_status") not in ("paid_customer", "churned")
+             and "Aircall" not in (c["properties"].get("hs_object_source_detail_1") or "")  # inbound-call bare contacts, not prospects
              and not any((c["properties"].get("email") or "").lower().startswith(p) for p in SYS_INBOX)
              and not (c["properties"].get("email") or "").lower().endswith(
                  ("withsammy.ai", "@paintmelbourne.com", "ghostinspector.com", "@linkedin.com", "@privaterelay.appleid.com"))]
