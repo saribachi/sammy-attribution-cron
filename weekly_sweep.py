@@ -86,10 +86,13 @@ def collect():
     c["closed_on_call_total"] = total([{"propertyName": "closed_on_call", "operator": "EQ", "value": "true"}])
     # Aircall auto-create watch: bare Aircall contacts created this week should be
     # 0 now that the setting is off (Aug 12). Non-zero = it turned back on.
+    # Fixed cutoff = when Chris turned Aircall auto-create OFF (Aug 12 2026 18:00 UTC).
+    # Counts bare Aircall contacts created SINCE the fix, so pre-change ones don't
+    # keep false-alarming as the 7-day window rolls. 0 = setting still off.
     c["aircall_new"] = total([
         {"propertyName": "hs_object_source_detail_1", "operator": "CONTAINS_TOKEN", "value": "Aircall"},
         {"propertyName": "email", "operator": "NOT_HAS_PROPERTY"},
-        {"propertyName": "createdate", "operator": "GTE", "value": week_ms}])
+        {"propertyName": "createdate", "operator": "GTE", "value": "1786557600000"}])  # 2026-08-12T18:00:00Z
     # merge-integrity spot check: paid customers whose became_paid date sits in
     # the current week but whose latest status write was a merge (would signal
     # the guard is not keeping up)
@@ -180,7 +183,7 @@ def compose(c, prev):
               f"- Sales tracking: {c['paid_dated']} of {c['paid']} paying customers have an exact conversion date; {c['closed_on_call_total']} all-time same-day demo closes",
               f"- Data integrity: conversion dates reflect first real conversion (merge/re-sync artifacts filtered); {c['paid_future']} future-dated (expect 0)",
               f"- Pricing integrity: all plans and promo codes recognized" if not (c["unknown_plans"] or c["unknown_promos"]) else "- Pricing integrity: SEE PROBLEMS",
-              f"- Aircall auto-create: {'holding (0 new bare contacts this week)' if not c.get('aircall_new') else 'SEE PROBLEMS'}",
+              f"- Aircall auto-create: {'holding (0 new bare contacts since the fix)' if not c.get('aircall_new') else 'SEE PROBLEMS'}",
               ]
     if c.get("phoneless_new"):
         lines += ["", f"*Contacts created this week with NO phone: {c['phoneless_new']}*"]
