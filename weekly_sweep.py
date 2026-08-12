@@ -84,6 +84,12 @@ def collect():
     c["paid_dated"] = total([{"propertyName": "user_status", "operator": "EQ", "value": "paid_customer"},
                              {"propertyName": "became_paid_customer_date", "operator": "HAS_PROPERTY"}])
     c["closed_on_call_total"] = total([{"propertyName": "closed_on_call", "operator": "EQ", "value": "true"}])
+    # Aircall auto-create watch: bare Aircall contacts created this week should be
+    # 0 now that the setting is off (Aug 12). Non-zero = it turned back on.
+    c["aircall_new"] = total([
+        {"propertyName": "hs_object_source_detail_1", "operator": "CONTAINS_TOKEN", "value": "Aircall"},
+        {"propertyName": "email", "operator": "NOT_HAS_PROPERTY"},
+        {"propertyName": "createdate", "operator": "GTE", "value": week_ms}])
     # merge-integrity spot check: paid customers whose became_paid date sits in
     # the current week but whose latest status write was a merge (would signal
     # the guard is not keeping up)
@@ -156,6 +162,7 @@ def compose(c, prev):
     if not c["dash_ok"]: problems.append("attribution.hirecharm.com is not returning all report sections")
     if c["deals_no_amount"] > 300: problems.append(f"blank deal amounts grew to {c['deals_no_amount']} (baseline ~248)")
     if c.get("stale_meetings"): problems.append(f"{c['stale_meetings']} past meetings (30d) still say Scheduled or have no outcome - outcomes not being updated, ask the rep to mark them")
+    if c.get("aircall_new"): problems.append(f"{c['aircall_new']} new bare Aircall contacts created this week - the Aircall auto-create-contact setting has turned back on, switch it off again")
 
     lines = [f"*Sammy Weekly Sweep: {day}*", ""]
     if prev:
@@ -173,6 +180,7 @@ def compose(c, prev):
               f"- Sales tracking: {c['paid_dated']} of {c['paid']} paying customers have an exact conversion date; {c['closed_on_call_total']} all-time same-day demo closes",
               f"- Data integrity: conversion dates reflect first real conversion (merge/re-sync artifacts filtered); {c['paid_future']} future-dated (expect 0)",
               f"- Pricing integrity: all plans and promo codes recognized" if not (c["unknown_plans"] or c["unknown_promos"]) else "- Pricing integrity: SEE PROBLEMS",
+              f"- Aircall auto-create: {'holding (0 new bare contacts this week)' if not c.get('aircall_new') else 'SEE PROBLEMS'}",
               ]
     if c.get("phoneless_new"):
         lines += ["", f"*Contacts created this week with NO phone: {c['phoneless_new']}*"]
