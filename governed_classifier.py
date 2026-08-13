@@ -481,7 +481,8 @@ def ticket_followups():
     followup_task_created; owned-by-bot resolved tickets get Krishna as default."""
     from datetime import datetime, timedelta, timezone
     from zoneinfo import ZoneInfo
-    # Scan a rolling recent windowtickets, after = [], None
+    # Scan a rolling recent window
+    tickets, after = [], None
     while True:
         b = {"filterGroups": [{"filters": [
             {"propertyName": "hs_pipeline_stage", "operator": "EQ", "value": "4"},
@@ -603,7 +604,7 @@ def create_ready_tasks():
     (a closed task means Lucas already worked them), no paid/churned/internal."""
     from datetime import datetime, timedelta, timezone
     from zoneinfo import ZoneInfo
-    # Scan a rolling recent window# Scan a rolling recent window, NEWEST FIRST — not everything since June.
+    # Scan a rolling recent window, NEWEST FIRST — not everything since June.
     # The old all-since-June scan (600+) plus the 50/run cap let new leads get
     # stuck behind a backlog and never tasked (Lucas flagged, Aug 11).
     window = (datetime.now(timezone.utc) - timedelta(days=14)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -664,7 +665,8 @@ def ration_lucas_tasks():
     Tasks already due today are never pushed out. Enrich-first parks +7 days."""
     from datetime import datetime, timedelta, timezone
     from zoneinfo import ZoneInfo
-    # Scan a rolling recent windowtoday = datetime.now(ZoneInfo("Australia/Melbourne")).date()
+    # Scan a rolling recent window
+    today = datetime.now(ZoneInfo("Australia/Melbourne")).date()
 
     tasks, after = [], None
     while True:
@@ -802,6 +804,60 @@ def fix_call_owners():
         print(f"WARNING unmapped agents (calls stay contact-owner-owned, need HubSpot seats or mapping): {dict(unmapped)}")
     if total >= 10 and parsed / max(total, 1) < 0.7:
         print(f"WARNING call-note parse rate {round(parsed/total*100)}% — Aircall may have changed its note format; healer degraded")
+
+def reconcile_deals():
+    """Single dedup-aware authority for won deals (the blunt native 'Contact Paid
+    Customer -> Move Associated Deal to Closed Won' workflow is retired). Within the
+    SALES pipeline (default) ONLY: for each paid_customer that has an open deal but
+    NO won deal, move their newest open deal to Won. If a won deal already exists,
+    do nothing -- never create a second win. That existence check (not the old
+    date-based one) is what stops the duplicate-won-deal pileup. Onboarding and
+    partnership pipelines are never touched."""
+    WON = "decisionmakerboughtin"
+    OPEN_STAGES = {"appointmentscheduled", "presentationscheduled", "2843565802",
+                   "2851995329", "3774214843", "2054317800", "2845034230"}
+    paid, after = [], None
+    while True:
+        b = {"filterGroups": [{"filters": [{"propertyName": "user_status", "operator": "EQ", "value": "paid_customer"}]}],
+             "properties": ["email"], "limit": 200}
+        if after: b["after"] = after
+        st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/search", b)
+        paid += d.get("results", [])
+        after = d.get("paging", {}).get("next", {}).get("after")
+        if not after: break
+        time.sleep(0.2)
+    pids = [p["id"] for p in paid]
+    c2d = {}
+    for i in range(0, len(pids), 100):
+        st, a = req("POST", "https://api.hubapi.com/crm/v4/associations/contacts/deals/batch/read",
+                    {"inputs": [{"id": x} for x in pids[i:i+100]]})
+        for r in a.get("results", []):
+            c2d.setdefault(str(r["from"]["id"]), []).extend(str(t["toObjectId"]) for t in (r.get("to") or []))
+        time.sleep(0.2)
+    all_dids = sorted({d for ds in c2d.values() for d in ds})
+    dinfo = {}
+    for i in range(0, len(all_dids), 100):
+        st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/deals/batch/read",
+                    {"inputs": [{"id": x} for x in all_dids[i:i+100]],
+                     "properties": ["dealstage", "pipeline", "createdate"]})
+        for r in d.get("results", []): dinfo[r["id"]] = r["properties"]
+        time.sleep(0.2)
+    moves = []
+    for cid, dids in c2d.items():
+        sales = [(did, dinfo[did]) for did in dids if did in dinfo and dinfo[did].get("pipeline") == "default"]
+        if not sales: continue
+        if any(p.get("dealstage") == WON for _, p in sales): continue     # already won -> dedup, skip
+        opens = [(did, p) for did, p in sales if p.get("dealstage") in OPEN_STAGES]
+        if not opens: continue
+        newest = max(opens, key=lambda dp: dp[1].get("createdate") or "")
+        moves.append(newest[0])
+    if COMMIT:
+        for i in range(0, len(moves), 100):
+            req("POST", "https://api.hubapi.com/crm/v3/objects/deals/batch/update",
+                {"inputs": [{"id": did, "properties": {"dealstage": WON}} for did in moves[i:i+100]]})
+            time.sleep(0.3)
+    print(f"deal reconciler: {len(paid)} paid customers, {len(moves)} open sales deals moved to Won (had 0 win)" + ("" if COMMIT else " [dry-run]"))
+
 
 def main():
     if not TOKEN: sys.exit("Set HUBSPOT_TOKEN to the attribution writer token (30858065).")

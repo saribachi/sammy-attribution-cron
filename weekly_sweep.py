@@ -93,6 +93,33 @@ def collect():
         {"propertyName": "hs_object_source_detail_1", "operator": "CONTAINS_TOKEN", "value": "Aircall"},
         {"propertyName": "email", "operator": "NOT_HAS_PROPERTY"},
         {"propertyName": "createdate", "operator": "GTE", "value": "1786557600000"}])  # 2026-08-12T18:00:00Z
+
+    # duplicate won-deal watch: customers with 2+ Closed Won deals in the SALES
+    # pipeline. Should be 0 now the blunt 'move to won' workflow is retired and the
+    # reconciler dedups on existence. >0 = a regression (something double-won a customer).
+    won_deals, dafter = [], None
+    while True:
+        wb = {"filterGroups": [{"filters": [
+            {"propertyName": "pipeline", "operator": "EQ", "value": "default"},
+            {"propertyName": "dealstage", "operator": "EQ", "value": "decisionmakerboughtin"}]}],
+            "properties": ["dealname"], "limit": 100}
+        if dafter: wb["after"] = dafter
+        dd = req("POST", "https://api.hubapi.com/crm/v3/objects/deals/search", wb)
+        won_deals += dd.get("results", [])
+        dafter = dd.get("paging", {}).get("next", {}).get("after")
+        if not dafter: break
+        time.sleep(0.2)
+    wcount = {}
+    wids = [d["id"] for d in won_deals]
+    for i in range(0, len(wids), 100):
+        aa = req("POST", "https://api.hubapi.com/crm/v4/associations/deals/contacts/batch/read",
+                 {"inputs": [{"id": x} for x in wids[i:i+100]]})
+        for r in aa.get("results", []):
+            to = r.get("to") or []
+            if to:
+                k = str(to[0]["toObjectId"]); wcount[k] = wcount.get(k, 0) + 1
+        time.sleep(0.2)
+    c["dupe_won"] = sum(1 for n in wcount.values() if n >= 2)
     # merge-integrity spot check: paid customers whose became_paid date sits in
     # the current week but whose latest status write was a merge (would signal
     # the guard is not keeping up)
@@ -166,6 +193,7 @@ def compose(c, prev):
     if c["deals_no_amount"] > 300: problems.append(f"blank deal amounts grew to {c['deals_no_amount']} (baseline ~248)")
     if c.get("stale_meetings"): problems.append(f"{c['stale_meetings']} past meetings (30d) still say Scheduled or have no outcome - outcomes not being updated, ask the rep to mark them")
     if c.get("aircall_new"): problems.append(f"{c['aircall_new']} new bare Aircall contacts created this week - the Aircall auto-create-contact setting has turned back on, switch it off again")
+    if c.get("dupe_won"): problems.append(f"{c['dupe_won']} customers have 2+ Closed Won deals in the sales pipeline - duplicate-win dedup regressed, investigate")
 
     lines = [f"*Sammy Weekly Sweep: {day}*", ""]
     if prev:
@@ -184,6 +212,7 @@ def compose(c, prev):
               f"- Data integrity: conversion dates reflect first real conversion (merge/re-sync artifacts filtered); {c['paid_future']} future-dated (expect 0)",
               f"- Pricing integrity: all plans and promo codes recognized" if not (c["unknown_plans"] or c["unknown_promos"]) else "- Pricing integrity: SEE PROBLEMS",
               f"- Aircall auto-create: {'holding (0 new bare contacts since the fix)' if not c.get('aircall_new') else 'SEE PROBLEMS'}",
+              f"- Duplicate wins: {'clean (0 customers with 2+ Closed Won)' if not c.get('dupe_won') else 'SEE PROBLEMS'}",
               ]
     if c.get("phoneless_new"):
         lines += ["", f"*Contacts created this week with NO phone: {c['phoneless_new']}*"]
