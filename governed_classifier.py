@@ -381,11 +381,13 @@ KRISHNA = "162267743"
 SAMMY_BOT = "162258278"
 
 def stamp_demo_reminder_time():
-    """next_lucas_demo_time = start of the contact's soonest UPCOMING is_demo
-    meeting (Lucas's scheduling link). Enrollment source for the pre-demo SMS
-    workflow; populated ONLY for Lucas demos so reminders never fire for other
-    meeting activity. Recomputed hourly: reflects the next demo, clears when none
-    upcoming so a later booking re-triggers enrollment."""
+    """next_lucas_demo_time + next_lucas_demo_link = the start time and Google Meet
+    join link of the contact's soonest UPCOMING is_demo meeting (Lucas's scheduling
+    link). Enrollment source + link token for the pre-demo SMS workflow; populated
+    ONLY for Lucas demos so reminders never fire for other meeting activity.
+    Recomputed hourly: reflects the next demo and follows a reschedule (including a
+    new Meet link), and clears both when none upcoming so a later booking re-triggers
+    enrollment."""
     from datetime import datetime, timezone
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     # upcoming demo meetings
@@ -394,48 +396,49 @@ def stamp_demo_reminder_time():
         b = {"filterGroups": [{"filters": [
             {"propertyName": "is_demo", "operator": "EQ", "value": "true"},
             {"propertyName": "hs_meeting_start_time", "operator": "GT", "value": now_iso}]}],
-            "properties": ["hs_meeting_start_time"], "limit": 100}
+            "properties": ["hs_meeting_start_time", "hs_meeting_location"], "limit": 100}
         if after: b["after"] = after
         st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/meetings/search", b)
         meetings += d.get("results", [])
         after = d.get("paging", {}).get("next", {}).get("after")
         if not after: break
         time.sleep(0.2)
-    # soonest upcoming demo per contact
+    # soonest upcoming demo per contact -> (start, join link)
     want = {}
     for m in meetings:
         st = m["properties"].get("hs_meeting_start_time")
+        link = m["properties"].get("hs_meeting_location") or ""
         sta, a = req("GET", f"https://api.hubapi.com/crm/v4/objects/meetings/{m['id']}/associations/contacts")
         for c in (a.get("results") or []):
             cid = str(c["toObjectId"])
-            if cid not in want or st < want[cid]:
-                want[cid] = st
+            if cid not in want or st < want[cid][0]:
+                want[cid] = (st, link)
         time.sleep(0.1)
-    # current holders of the property (to clear stale ones)
-    holders, after = set(), None
+    # current holders (to refresh/clear) -> {cid: (time, link)}
+    holders, after = {}, None
     while True:
         b = {"filterGroups": [{"filters": [{"propertyName": "next_lucas_demo_time", "operator": "HAS_PROPERTY"}]}],
-             "properties": ["next_lucas_demo_time"], "limit": 100}
+             "properties": ["next_lucas_demo_time", "next_lucas_demo_link"], "limit": 100}
         if after: b["after"] = after
         st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/search", b)
-        for r in d.get("results", []): holders.add((r["id"], r["properties"].get("next_lucas_demo_time")))
+        for r in d.get("results", []):
+            holders[r["id"]] = (r["properties"].get("next_lucas_demo_time"), r["properties"].get("next_lucas_demo_link"))
         after = d.get("paging", {}).get("next", {}).get("after")
         if not after: break
         time.sleep(0.2)
     updates = []
-    for cid, st in want.items():
-        cur = dict(holders).get(cid)
-        if cur != st:
-            updates.append({"id": cid, "properties": {"next_lucas_demo_time": st}})
-    for cid, cur in holders:
-        if cid not in want:  # demo passed / gone -> clear
-            updates.append({"id": cid, "properties": {"next_lucas_demo_time": ""}})
+    for cid, (st, link) in want.items():
+        cur_t, cur_l = holders.get(cid, (None, None))
+        if cur_t != st or (cur_l or "") != (link or ""):
+            updates.append({"id": cid, "properties": {"next_lucas_demo_time": st, "next_lucas_demo_link": link}})
+    for cid in holders:
+        if cid not in want:  # demo passed / gone -> clear both
+            updates.append({"id": cid, "properties": {"next_lucas_demo_time": "", "next_lucas_demo_link": ""}})
     if COMMIT:
         for i in range(0, len(updates), 100):
             req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/batch/update", {"inputs": updates[i:i+100]})
             time.sleep(0.3)
-    print(f"demo reminder time: {len(meetings)} upcoming demos, {len(want)} contacts, {len(updates)} stamped/cleared" + ("" if COMMIT else " [dry-run]"))
-
+    print(f"demo reminder time+link: {len(meetings)} upcoming demos, {len(want)} contacts, {len(updates)} stamped/cleared" + ("" if COMMIT else " [dry-run]"))
 
 def route_tickets():
     """Support routing (Krishna's rule Aug 6): current customer tickets -> Krishna,
