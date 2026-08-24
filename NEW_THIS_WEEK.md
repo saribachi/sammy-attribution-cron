@@ -14,3 +14,4 @@
 - Support ticket auto-routing live: new tickets move off the bot to the right person automatically by customer status (paying customer to Krishna, everyone else to Lucas), re-checked hourly. Manual assignments and dev/founder escalations are never overridden.
 - Support follow-up automation: when a ticket is marked Resolved, a follow-up task is created 2 days later for the owner to confirm it stayed resolved.
 - Fixed a mis-routed support ticket where a customer (Jayden) who signed up on Lucas's computer had his ticket land on Lucas's record; moved it and his deal to his own contact.
+- Pre-demo SMS reminders now text the contact's **mobile** when one is on file (new `next_lucas_demo_sms_number`, stamped hourly). Aircall could not text AU landlines/1300/1800, which silently dropped ~10% of reminders.

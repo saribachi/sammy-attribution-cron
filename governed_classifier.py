@@ -381,7 +381,7 @@ KRISHNA = "162267743"
 SAMMY_BOT = "162258278"
 
 def stamp_demo_reminder_time():
-    """next_lucas_demo_time + next_lucas_demo_link = the start time and Google Meet
+    """next_lucas_demo_time + next_lucas_demo_link + next_lucas_demo_sms_number = the start time, Google Meet
     join link of the contact's soonest UPCOMING is_demo meeting (Lucas's scheduling
     link). Enrollment source + link token for the pre-demo SMS workflow; populated
     ONLY for Lucas demos so reminders never fire for other meeting activity.
@@ -414,26 +414,49 @@ def stamp_demo_reminder_time():
             if cid not in want or st < want[cid][0]:
                 want[cid] = (st, link)
         time.sleep(0.1)
-    # current holders (to refresh/clear) -> {cid: (time, link)}
+    # SMS-capable number per booker: the mobile when one is on file, else phone.
+    # Aircall cannot text AU landlines (02/03/07/08) or 1300/1800, and the profile
+    # `phone` is app-synced so the real mobile often sits in `mobilephone` (see the
+    # Aug 12 two-numbers finding). READ-ONLY on phone/mobilephone: never writes them.
+    import re as _re_sms
+    def _sms_ok(p):
+        if not p: return False
+        d = _re_sms.sub(r"\D", "", p)
+        if d.startswith("61"): d = "0" + d[2:]
+        return d.startswith("04") and len(d) == 10
+    numbers, cid_list = {}, list(want)
+    for i in range(0, len(cid_list), 100):
+        st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/batch/read",
+                    {"properties": ["phone", "mobilephone"],
+                     "inputs": [{"id": c} for c in cid_list[i:i+100]]})
+        for r in d.get("results", []):
+            ph, mob = r["properties"].get("phone"), r["properties"].get("mobilephone")
+            numbers[r["id"]] = next((c for c in (mob, ph) if _sms_ok(c)), ph or mob or "")
+        time.sleep(0.2)
+    # current holders (to refresh/clear) -> {cid: (time, link, sms number)}
     holders, after = {}, None
     while True:
         b = {"filterGroups": [{"filters": [{"propertyName": "next_lucas_demo_time", "operator": "HAS_PROPERTY"}]}],
-             "properties": ["next_lucas_demo_time", "next_lucas_demo_link"], "limit": 100}
+             "properties": ["next_lucas_demo_time", "next_lucas_demo_link", "next_lucas_demo_sms_number"], "limit": 100}
         if after: b["after"] = after
         st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/search", b)
         for r in d.get("results", []):
-            holders[r["id"]] = (r["properties"].get("next_lucas_demo_time"), r["properties"].get("next_lucas_demo_link"))
+            holders[r["id"]] = (r["properties"].get("next_lucas_demo_time"), r["properties"].get("next_lucas_demo_link"),
+                                r["properties"].get("next_lucas_demo_sms_number"))
         after = d.get("paging", {}).get("next", {}).get("after")
         if not after: break
         time.sleep(0.2)
     updates = []
     for cid, (st, link) in want.items():
-        cur_t, cur_l = holders.get(cid, (None, None))
-        if cur_t != st or (cur_l or "") != (link or ""):
-            updates.append({"id": cid, "properties": {"next_lucas_demo_time": st, "next_lucas_demo_link": link}})
+        cur_t, cur_l, cur_n = holders.get(cid, (None, None, None))
+        num = numbers.get(cid, "")
+        if cur_t != st or (cur_l or "") != (link or "") or (cur_n or "") != (num or ""):
+            updates.append({"id": cid, "properties": {"next_lucas_demo_time": st, "next_lucas_demo_link": link,
+                                                      "next_lucas_demo_sms_number": num}})
     for cid in holders:
-        if cid not in want:  # demo passed / gone -> clear both
-            updates.append({"id": cid, "properties": {"next_lucas_demo_time": "", "next_lucas_demo_link": ""}})
+        if cid not in want:  # demo passed / gone -> clear all three
+            updates.append({"id": cid, "properties": {"next_lucas_demo_time": "", "next_lucas_demo_link": "",
+                                                      "next_lucas_demo_sms_number": ""}})
     if COMMIT:
         for i in range(0, len(updates), 100):
             req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/batch/update", {"inputs": updates[i:i+100]})
