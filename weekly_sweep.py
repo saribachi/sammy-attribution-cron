@@ -209,11 +209,21 @@ def compose(c, prev):
               f"- Deals: {c['deals'] - c['deals_no_source']} of {c['deals']} have a source; {c['deals_no_amount']} blank amounts (free/no-plan contacts)",
               f"- Campaign visibility: {c['clay_campaign']} contacts carry a reply campaign",
               f"- Sales tracking: {c['paid_dated']} of {c['paid']} paying customers have an exact conversion date; {c['closed_on_call_total']} all-time same-day demo closes",
-              f"- Data integrity: conversion dates reflect first real conversion (merge/re-sync artifacts filtered); {c['paid_future']} future-dated (expect 0)",
-              f"- Pricing integrity: all plans and promo codes recognized" if not (c["unknown_plans"] or c["unknown_promos"]) else "- Pricing integrity: SEE PROBLEMS",
-              f"- Aircall auto-create: {'holding (0 new bare contacts since the fix)' if not c.get('aircall_new') else 'SEE PROBLEMS'}",
-              f"- Duplicate wins: {'clean (0 customers with 2+ Closed Won)' if not c.get('dupe_won') else 'SEE PROBLEMS'}",
               ]
+    # Regression watches: every check still runs, but a permanently-green watch
+    # does not earn its own line every week. Detail appears only when one fires;
+    # the specifics then land in *Needs attention* above.
+    watches = [("pricing", not (c["unknown_plans"] or c["unknown_promos"])),
+               ("future-dated conversions", not c.get("paid_future")),
+               ("Aircall auto-create", not c.get("aircall_new")),
+               ("duplicate wins", not c.get("dupe_won"))]
+    failing = [n for n, ok in watches if not ok]
+    if failing:
+        lines.append(f"- Regression watches: {', '.join(failing)} SEE PROBLEMS "
+                     f"({len(watches) - len(failing)} of {len(watches)} green)")
+    else:
+        lines.append(f"- Regression watches: all green "
+                     f"({', '.join(n for n, _ in watches)})")
     if c.get("phoneless_new"):
         lines += ["", f"*Contacts created this week with NO phone: {c['phoneless_new']}*"]
         for src, e in c["phoneless_by_source"][:6]:

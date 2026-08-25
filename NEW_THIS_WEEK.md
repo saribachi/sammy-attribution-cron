@@ -1,17 +1,4 @@
 # New this week (included in the next Monday sweep, then cleared via commit)
-- New contact property "Became Paid Customer Date": exact moment each customer started paying, backfilled for all existing customers from status history, stamped hourly. This is now the source of truth for sales counting everywhere.
-- New contact property "Closed On Call": marks customers who paid the same day as a completed demo with Lucas. 21 historical same-day closes found. Updates hourly.
-- New meeting property "Is Demo": tags every booking from Lucas's scheduling link (260 backfilled, new ones tag within the hour). Reports filter on this instead of meeting source.
-- Deal records now mirror reality: every paying customer has a won deal in the Sales Pipeline dated to their actual conversion (49 corrected, 5 created). Enforced hourly. Sales and Onboarding pipelines each keep their own deal by design.
-- Lucas scorecard live at attribution.hirecharm.com/lucas: dials, unique dials, demos booked and completed, outcomes, closed on call, sales made, with click-through to every record behind each number.
-- New HubSpot dashboards built by Chris: Lucas daily dashboard and weekly sales dashboard (dials, unique dials, demos, stacked outcome chart, closed on call, sales made).
-- Week convention unified: all surfaces use HubSpot's Sunday-start weeks in Melbourne time.
-- Task system: no call tasks are created without a phone number; tasks appear automatically the hour a phone number lands; queue deals Lucas 100 tasks per day.
-- Meeting hygiene rule live: past meetings still marked Scheduled or unmarked are flagged in this sweep (53 found at rollout, Lucas clearing).
-- Data accuracy fix (Lucas caught this): the "new paying customers this week" count was overstated because contact merges and system re-syncs were re-dating old customers into the current week. Fixed so the conversion date is the first real time someone became a customer; 62 dates corrected. This week's list now matches what the team actually closed.
-- Conversion dates now also kept for customers who later churned, so past weeks' sales numbers stay accurate in history instead of dropping off when someone leaves.
-- New automated guardrail: contact merges can silently overwrite attribution and conversion data (they bypass normal protections). An hourly check now detects and reverts any merge that changes a source channel, and corrects any re-dated conversion. 5 mis-attributed customers were restored this week.
-- Support ticket auto-routing live: new tickets move off the bot to the right person automatically by customer status (paying customer to Krishna, everyone else to Lucas), re-checked hourly. Manual assignments and dev/founder escalations are never overridden.
-- Support follow-up automation: when a ticket is marked Resolved, a follow-up task is created 2 days later for the owner to confirm it stayed resolved.
-- Fixed a mis-routed support ticket where a customer (Jayden) who signed up on Lucas's computer had his ticket land on Lucas's record; moved it and his deal to his own contact.
-- Pre-demo SMS reminders now text the contact's **mobile** when one is on file (new `next_lucas_demo_sms_number`, stamped hourly). Aircall could not text AU landlines/1300/1800, which silently dropped ~10% of reminders.
+#
+# Empty = nothing shipped since the last sweep, and the sweep omits the
+# section entirely. Add a bullet per ship; clear this file after it posts.
