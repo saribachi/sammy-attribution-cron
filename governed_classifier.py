@@ -885,6 +885,85 @@ def reconcile_deals():
     print(f"deal reconciler: {len(paid)} paid customers, {len(moves)} open sales deals moved to Won (had 0 win)" + ("" if COMMIT else " [dry-run]"))
 
 
+def stamp_quotes_since_purchase():
+    """Post-purchase activation signal. estimate_count is ABSOLUTE, so a HubSpot
+    filter cannot express "three more quotes since they started paying" - someone
+    who bought with 20 quotes behind them looks identical to someone who bought
+    with 2. So we keep two fields of our own:
+
+      estimate_count_at_purchase  the count at the moment became_paid_customer_date
+                                  was set. Written ONCE, never updated after, so a
+                                  later deletion cannot move the baseline.
+      quotes_since_purchase       current estimate_count minus that baseline.
+
+    Backfilled 14 Sep 2026 across 228 customers from estimate_count property
+    history. This keeps it current for everyone who converts from here, and drives
+    the First Six Weeks post-purchase flow. Floors at 0: estimate_count is a live
+    snapshot that drops when a tradie deletes an estimate, and a negative would be
+    meaningless."""
+    contacts, after = [], None
+    while True:
+        b = {"filterGroups": [{"filters": [
+            {"propertyName": "became_paid_customer_date", "operator": "HAS_PROPERTY"}]}],
+            "limit": 100,
+            "properties": ["became_paid_customer_date", "estimate_count",
+                           "estimate_count_at_purchase", "quotes_since_purchase"]}
+        if after: b["after"] = after
+        st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/search", b)
+        contacts += d.get("results", [])
+        after = d.get("paging", {}).get("next", {}).get("after")
+        if not after: break
+        time.sleep(0.2)
+
+    def _num(v):
+        try: return float(v)
+        except (TypeError, ValueError): return None
+
+    # Anyone missing a baseline needs it derived from history. Everyone else only
+    # needs the difference refreshed, which is one subtraction and no extra reads.
+    need_baseline = [c for c in contacts if _num(c["properties"].get("estimate_count_at_purchase")) is None]
+    baselines = {}
+    for i in range(0, len(need_baseline), 50):
+        chunk = need_baseline[i:i+50]
+        st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/batch/read",
+                    {"inputs": [{"id": c["id"]} for c in chunk],
+                     "properties": ["became_paid_customer_date"],
+                     "propertiesWithHistory": ["estimate_count"]})
+        for r in d.get("results", []):
+            paid = r["properties"].get("became_paid_customer_date")
+            at = 0.0
+            for v in (r.get("propertiesWithHistory", {}).get("estimate_count") or []):
+                val = _num(v.get("value"))
+                if val is None: continue
+                if paid and v["timestamp"] <= paid:
+                    at = max(at, val)
+            baselines[r["id"]] = at
+        time.sleep(0.2)
+
+    updates = []
+    for c in contacts:
+        p = c["properties"]
+        base = _num(p.get("estimate_count_at_purchase"))
+        if base is None: base = baselines.get(c["id"])
+        if base is None: continue
+        now = _num(p.get("estimate_count")) or 0.0
+        since = max(0, int(now - base))
+        props = {}
+        if _num(p.get("estimate_count_at_purchase")) is None:
+            props["estimate_count_at_purchase"] = int(base)
+        if _num(p.get("quotes_since_purchase")) != since:
+            props["quotes_since_purchase"] = since
+        if props: updates.append({"id": c["id"], "properties": props})
+
+    if COMMIT:
+        for i in range(0, len(updates), 100):
+            req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/batch/update",
+                {"inputs": updates[i:i+100]})
+            time.sleep(0.3)
+    print(f"quotes-since-purchase: {len(contacts)} customers, {len(need_baseline)} new baselines, "
+          f"{len(updates)} updated" + ("" if COMMIT else " [dry-run]"))
+
+
 def main():
     if not TOKEN: sys.exit("Set HUBSPOT_TOKEN to the attribution writer token (30858065).")
     recs = all_contacts()
@@ -949,6 +1028,7 @@ def main():
     stamp_deal_amounts()
     stamp_became_paid()
     stamp_closed_on_call()
+    stamp_quotes_since_purchase()
     stamp_demo_meetings()
     stamp_demo_reminder_time()
     guard_merge_overwrites()
