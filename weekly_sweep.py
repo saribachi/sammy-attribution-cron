@@ -1,16 +1,18 @@
-"""Weekly Sammy sweep: deterministic health report posted to Slack.
+"""Weekly Sammy sweep: a short, change-only health report posted to Slack.
 
 Runs on the same always-on container as the hourly classifier. Fires once per
-ISO week, at/after Monday 15:00 UTC (8am US Pacific). If the container was down
-at fire time, it catches up at the next hourly tick, any day of that week.
-A crashed sweep still posts a short failure line to Slack: silence means the
-whole container is down, which the hourly attribution healing would also show.
+ISO week, at/after Monday 15:00 UTC (8am US Pacific); a failure retries hourly
+for the rest of that Monday and posts one FAILED line.
 
-Baseline for week-over-week deltas persists in /tmp; a redeploy resets it and
-the report says so instead of guessing.
+The post reports what changed this week (customers gained and lost, trial
+activation, the post-purchase flows, email send health), then lists only what is
+new or worsening. Every watch is counted over the last 7 days; a quiet watch
+says nothing. Standing conditions are deliberately not reported every week.
+The Gone Quiet week-over-week delta uses a baseline in /tmp, so it is omitted
+for the first post after a redeploy.
 """
 import json, os, time, urllib.error, urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 TOKEN = os.environ.get("HUBSPOT_TOKEN", "")
 WEBHOOK = os.environ.get("SLACK_WEBHOOK_URL", "")
@@ -57,131 +59,126 @@ def deal_total(filters):
     return d["total"]
 
 
-def collect():
-    c = {}
-    c["contacts"] = total([])
-    c["blank_channel"] = total([{"propertyName": "original_source_channel", "operator": "NOT_HAS_PROPERTY"}])
+def _when(v):
+    """HubSpot datetime, epoch-ms or plain date -> aware UTC datetime (None if blank)."""
+    if not v:
+        return None
+    if v.isdigit():
+        return datetime.fromtimestamp(int(v) / 1000, timezone.utc)
+    if "T" in v:
+        return datetime.fromisoformat(v.replace("Z", "+00:00"))
+    return datetime.fromisoformat(v).replace(tzinfo=timezone.utc)
 
-    week_ms = str(int((time.time() - 7 * 86400) * 1000))
+
+def _search_all(obj, filters, props, page=200):
+    out, after = [], None
+    while True:
+        b = {"filterGroups": [{"filters": filters}], "properties": props, "limit": page}
+        if after: b["after"] = after
+        d = req("POST", f"https://api.hubapi.com/crm/v3/objects/{obj}/search", b)
+        out += d["results"]
+        after = d.get("paging", {}).get("next", {}).get("after")
+        if not after: return out
+
+
+def collect():
+    """Everything the post reports is about THIS week: what changed, and anything
+    new or worsening. Standing conditions that never move are deliberately not
+    measured here, so they cannot fill the post with the same lines every week."""
+    now = datetime.now(timezone.utc)
+    week_ago = now - timedelta(days=7)
+    week_ms = str(int(week_ago.timestamp() * 1000))
+    c = {}
+
+    # ---- Customers: who is paying, who joined, who left
+    paid = _search_all("contacts", [{"propertyName": "user_status", "operator": "EQ", "value": "paid_customer"}],
+                       ["sammy_pricing_plan", "sammy_promo_code", "became_paid_customer_date", "last_estimate_date",
+                        "last_app_login_date", "quotes_since_purchase"])
+    c["paid"] = len(paid)
+    c["mrr"] = sum(max(PLAN_AMOUNT.get(p["properties"].get("sammy_pricing_plan"), 59)
+                       - PROMO_MONTHLY_DISCOUNT.get(p["properties"].get("sammy_promo_code"), 0), 0) for p in paid)
+    c["new_payers"] = sum(1 for p in paid if (_when(p["properties"].get("became_paid_customer_date")) or now) >= week_ago
+                          and p["properties"].get("became_paid_customer_date"))
+    churned = _search_all("contacts", [{"propertyName": "user_status", "operator": "EQ", "value": "churned"}], ["email"])
+    c["churned"] = 0
+    ids = [x["id"] for x in churned]
+    for i in range(0, len(ids), 50):
+        d = req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/batch/read",
+                {"properties": ["email"], "propertiesWithHistory": ["user_status"], "inputs": [{"id": x} for x in ids[i:i + 50]]})
+        for r in d.get("results", []):
+            h = r.get("propertiesWithHistory", {}).get("user_status", [])
+            if h and h[0]["value"] == "churned" and _when(h[0]["timestamp"]) >= week_ago:
+                c["churned"] += 1
+    c["unknown_plans"] = sorted({p["properties"].get("sammy_pricing_plan") for p in paid} - PLAN_VALUES - {None})
+    c["unknown_promos"] = sorted({p["properties"].get("sammy_promo_code") for p in paid} - PROMO_VALUES - {None})
+    c["paid_undated"] = sum(1 for p in paid if not p["properties"].get("became_paid_customer_date"))
+    c["paid_future"] = sum(1 for p in paid if (_when(p["properties"].get("became_paid_customer_date")) or now) > now)
+
+    # ---- Trials: started this week, and how last week's cohort activated
+    trials = _search_all("contacts", [{"propertyName": "sammy_trial_start_date", "operator": "GTE",
+                                       "value": str(int((now - timedelta(days=14)).timestamp() * 1000))}],
+                         ["sammy_trial_start_date", "estimate_count"])
+    this_wk = [t for t in trials if _when(t["properties"].get("sammy_trial_start_date")) >= week_ago]
+    last_wk = [t for t in trials if _when(t["properties"].get("sammy_trial_start_date")) < week_ago]
+    c["trials"] = len(this_wk)
+    c["prev_trials"] = len(last_wk)
+    c["prev_activated"] = sum(1 for t in last_wk if float(t["properties"].get("estimate_count") or 0) >= 1)
+
+    # ---- Post-purchase flows: are they working
+    def dormant(p):
+        pr = p["properties"]
+        bp, lg, es = (_when(pr.get(k)) for k in ("became_paid_customer_date", "last_app_login_date", "last_estimate_date"))
+        return bp and (now - bp).days > 42 and (not lg or (now - lg).days > 10) and (not es or (now - es).days > 10)
+    dorm = [p for p in paid if dormant(p)]
+    c["gone_quiet"] = len(dorm)
+    c["gone_quiet_mrr"] = sum(max(PLAN_AMOUNT.get(p["properties"].get("sammy_pricing_plan"), 59)
+                                  - PROMO_MONTHLY_DISCOUNT.get(p["properties"].get("sammy_promo_code"), 0), 0) for p in dorm)
+    fsw = [p for p in paid if _when(p["properties"].get("became_paid_customer_date"))
+           and 14 < (now - _when(p["properties"]["became_paid_customer_date"])).days <= 28]
+    c["fsw"] = len(fsw)
+    c["fsw_hit3"] = sum(1 for p in fsw if float(p["properties"].get("quotes_since_purchase") or 0) >= 3)
+
+    # ---- Watches, all counted over THIS week only
+    c["new_no_channel"] = total([{"propertyName": "createdate", "operator": "GTE", "value": week_ms},
+                                 {"propertyName": "original_source_channel", "operator": "NOT_HAS_PROPERTY"}])
     d = req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/search", {
         "filterGroups": [{"filters": [
             {"propertyName": "createdate", "operator": "GTE", "value": week_ms},
             {"propertyName": "hs_object_source_detail_1", "operator": "CONTAINS_TOKEN", "value": "Outbound"}]}],
-        "properties": ["email", "firstname"], "limit": 100})
-    c["webhook_new"] = d["total"]
-    c["webhook_nameless"] = sum(1 for r in d["results"] if not r["properties"].get("firstname"))
+        "properties": ["email"], "limit": 100})
     c["webhook_sysinbox"] = sum(1 for r in d["results"] if any(
-        (r["properties"].get("email") or "").startswith(p)
-        for p in ("support@", "noreply@", "no-reply@", "notifications@")))
-
-    c["deals"] = deal_total([])
-    c["deals_no_source"] = deal_total([{"propertyName": "deal_source", "operator": "NOT_HAS_PROPERTY"}])
-    c["deals_no_amount"] = deal_total([{"propertyName": "amount", "operator": "NOT_HAS_PROPERTY"}])
-
-    paid, after = [], None
-    while True:
-        b = {"filterGroups": [{"filters": [{"propertyName": "user_status", "operator": "EQ", "value": "paid_customer"}]}],
-             "properties": ["sammy_pricing_plan", "sammy_promo_code"], "limit": 200}
-        if after: b["after"] = after
-        d = req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/search", b)
-        paid += d["results"]
-        after = d.get("paging", {}).get("next", {}).get("after")
-        if not after: break
-        time.sleep(0.2)
-    c["paid"] = len(paid)
-    c["unknown_plans"] = sorted({p["properties"].get("sammy_pricing_plan") for p in paid} - PLAN_VALUES - {None})
-    c["unknown_promos"] = sorted({p["properties"].get("sammy_promo_code") for p in paid} - PROMO_VALUES - {None})
-
-    c["clay_campaign"] = total([{"propertyName": "cold_email_reply_campaign", "operator": "HAS_PROPERTY"}])
-    c["paid_dated"] = total([{"propertyName": "user_status", "operator": "EQ", "value": "paid_customer"},
-                             {"propertyName": "became_paid_customer_date", "operator": "HAS_PROPERTY"}])
-    c["closed_on_call_total"] = total([{"propertyName": "closed_on_call", "operator": "EQ", "value": "true"}])
-    # Aircall auto-create watch: bare Aircall contacts created this week should be
-    # 0 now that the setting is off (Aug 12). Non-zero = it turned back on.
-    # Fixed cutoff = when Chris turned Aircall auto-create OFF (Aug 12 2026 18:00 UTC).
-    # Counts bare Aircall contacts created SINCE the fix, so pre-change ones don't
-    # keep false-alarming as the 7-day window rolls. 0 = setting still off.
+        (r["properties"].get("email") or "").startswith(p) for p in ("support@", "noreply@", "no-reply@", "notifications@")))
     c["aircall_new"] = total([
         {"propertyName": "hs_object_source_detail_1", "operator": "CONTAINS_TOKEN", "value": "Aircall"},
         {"propertyName": "email", "operator": "NOT_HAS_PROPERTY"},
-        {"propertyName": "createdate", "operator": "GTE", "value": "1786557600000"}])  # 2026-08-12T18:00:00Z
-
-    # duplicate won-deal watch: customers with 2+ Closed Won deals in the SALES
-    # pipeline. Should be 0 now the blunt 'move to won' workflow is retired and the
-    # reconciler dedups on existence. >0 = a regression (something double-won a customer).
-    won_deals, dafter = [], None
-    while True:
-        wb = {"filterGroups": [{"filters": [
-            {"propertyName": "pipeline", "operator": "EQ", "value": "default"},
-            {"propertyName": "dealstage", "operator": "EQ", "value": "decisionmakerboughtin"}]}],
-            "properties": ["dealname"], "limit": 100}
-        if dafter: wb["after"] = dafter
-        dd = req("POST", "https://api.hubapi.com/crm/v3/objects/deals/search", wb)
-        won_deals += dd.get("results", [])
-        dafter = dd.get("paging", {}).get("next", {}).get("after")
-        if not dafter: break
-        time.sleep(0.2)
-    wcount = {}
-    wids = [d["id"] for d in won_deals]
+        {"propertyName": "createdate", "operator": "GTE", "value": week_ms}])
+    # duplicate wins created THIS week: a won deal from the last 7 days on a customer who already had one
+    won = _search_all("deals", [{"propertyName": "pipeline", "operator": "EQ", "value": "default"},
+                                {"propertyName": "dealstage", "operator": "EQ", "value": "decisionmakerboughtin"}],
+                      ["createdate"], page=100)
+    by_contact = {}
+    wids = [x["id"] for x in won]
+    created = {x["id"]: _when(x["properties"].get("createdate")) for x in won}
     for i in range(0, len(wids), 100):
         aa = req("POST", "https://api.hubapi.com/crm/v4/associations/deals/contacts/batch/read",
-                 {"inputs": [{"id": x} for x in wids[i:i+100]]})
+                 {"inputs": [{"id": x} for x in wids[i:i + 100]]})
         for r in aa.get("results", []):
             to = r.get("to") or []
-            if to:
-                k = str(to[0]["toObjectId"]); wcount[k] = wcount.get(k, 0) + 1
-        time.sleep(0.2)
-    c["dupe_won"] = sum(1 for n in wcount.values() if n >= 2)
-    # merge-integrity spot check: paid customers whose became_paid date sits in
-    # the current week but whose latest status write was a merge (would signal
-    # the guard is not keeping up)
-    import time as _t
-    wk_start = str(int((_t.time() - (_t.time() % 604800)) * 1000))
-    c["paid_future"] = total([{"propertyName": "became_paid_customer_date", "operator": "GT", "value": str(int(_t.time() * 1000))}])
-
-    # missing-data visibility: contacts created last 7d without a phone,
-    # grouped by creation source, so incomplete pipes stay visible (Chris, Aug 3)
-    d = req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/search", {
-        "filterGroups": [{"filters": [
-            {"propertyName": "createdate", "operator": "GTE", "value": week_ms},
-            {"propertyName": "hs_calculated_phone_number", "operator": "NOT_HAS_PROPERTY"},
-            {"propertyName": "phone", "operator": "NOT_HAS_PROPERTY"}]}],
-        "properties": ["hs_object_source_label", "hs_object_source_detail_1", "firstname"], "limit": 200})
-    srcs = {}
-    for r in d["results"]:
-        p = r["properties"]
-        key = (p.get("hs_object_source_detail_1") or p.get("hs_object_source_label") or "unknown source")
-        e = srcs.setdefault(key, {"n": 0, "nameless": 0})
-        e["n"] += 1
-        if not p.get("firstname"): e["nameless"] += 1
-    c["phoneless_new"] = d["total"]
-    c["phoneless_by_source"] = sorted(srcs.items(), key=lambda kv: -kv[1]["n"])
-
-    # stale meeting outcomes: meetings that already happened but still say
-    # Scheduled or have no outcome (Chris's rule: impossible state, Aug 4)
-    now_ms = str(int(time.time() * 1000))
-    month_ago = str(int((time.time() - 30 * 86400) * 1000))
+            if to: by_contact.setdefault(str(to[0]["toObjectId"]), []).append(created.get(str(r["from"]["id"])))
+    c["new_dupe_won"] = sum(1 for ds in by_contact.values()
+                            if len(ds) >= 2 and max(x for x in ds if x) >= week_ago)
+    # demos held THIS week that still have no outcome. Demos only: an unmarked demo
+    # breaks same-day-close reporting; internal meetings and support calls do not.
     stale = 0
     for f in ([{"propertyName": "hs_meeting_outcome", "operator": "EQ", "value": "SCHEDULED"}],
               [{"propertyName": "hs_meeting_outcome", "operator": "NOT_HAS_PROPERTY"}]):
-        d = req("POST", "https://api.hubapi.com/crm/v3/objects/meetings/search", {
-            "filterGroups": [{"filters": [
-                {"propertyName": "hs_timestamp", "operator": "BETWEEN", "value": month_ago, "highValue": now_ms}] + f}],
-            "limit": 1})
-        stale += d["total"]
+        dd = req("POST", "https://api.hubapi.com/crm/v3/objects/meetings/search", {
+            "filterGroups": [{"filters": [{"propertyName": "hs_timestamp", "operator": "BETWEEN", "value": week_ms,
+                                           "highValue": str(int(now.timestamp() * 1000))},
+                                          {"propertyName": "is_demo", "operator": "EQ", "value": "true"}] + f}], "limit": 1})
+        stale += dd["total"]
     c["stale_meetings"] = stale
 
-    # MRR computed directly (same formula as the dashboard and deal stamper) so
-    # the sweep never depends on the dashboard cache being warm
-    mrr = 0
-    for p in paid:
-        amt = PLAN_AMOUNT.get(p["properties"].get("sammy_pricing_plan"), 59)
-        amt -= PROMO_MONTHLY_DISCOUNT.get(p["properties"].get("sammy_promo_code"), 0)
-        mrr += max(amt, 0)
-    c["mrr"] = mrr
-
-    # dashboard health check: non-fatal, retried, cold caches can take a minute
-    # send audit: non-fatal, a failure here must not cost the rest of the report
     try:
         c["send_audit"] = audit_sends()
     except Exception as e:
@@ -315,77 +312,61 @@ def audit_sends(days=7):
 
 
 def compose(c, prev):
-    day = datetime.now(timezone.utc).strftime("%A %B %-d")
-    problems = []
-    if c["blank_channel"]: problems.append(f"{c['blank_channel']} contacts have no source channel (expected 0)")
-    if c["paid_dated"] < c["paid"]: problems.append(f"{c['paid'] - c['paid_dated']} paying customers missing a conversion date (stamper gap)")
-    if c.get("paid_future"): problems.append(f"{c['paid_future']} conversions dated in the future - merge or clock artifact, investigate")
-    if c["webhook_sysinbox"]: problems.append(f"{c['webhook_sysinbox']} system-inbox contacts leaked in this week")
-    if c["unknown_plans"]: problems.append(f"UNRECOGNIZED PRICING PLAN(S): {c['unknown_plans']} - dashboard and deal pricing maps need updating")
-    if c["unknown_promos"]: problems.append(f"UNRECOGNIZED PROMO CODE(S): {c['unknown_promos']} - discount mapping needed or MRR will drift")
-    if not c["dash_ok"]: problems.append("attribution.hirecharm.com is not returning all report sections")
-    if c["deals_no_amount"] > 300: problems.append(f"blank deal amounts grew to {c['deals_no_amount']} (baseline ~248)")
-    if c.get("stale_meetings"): problems.append(f"{c['stale_meetings']} past meetings (30d) still say Scheduled or have no outcome - outcomes not being updated, ask the rep to mark them")
-    if c.get("aircall_new"): problems.append(f"{c['aircall_new']} new bare Aircall contacts created this week - the Aircall auto-create-contact setting has turned back on, switch it off again")
+    """Short by design: what changed this week, then only what is new or worsening.
+    A watch that is quiet says nothing."""
+    day = datetime.now(timezone.utc).strftime("%a %-d %b")
+    pct = lambda a, b: f"{round(100 * a / b)}%" if b else "n/a"
     sa = c.get("send_audit") or {}
-    if sa.get("error"): problems.append(f"send audit did not run ({sa['error']}) - email misfires were NOT checked this week")
-    for k, n in sorted((sa.get("misfires") or {}).items()):
-        problems.append(f"EMAIL MISFIRE - {k}: {n} contact{'s' if n != 1 else ''} (names in the cron log)")
-    if sa.get("unmapped"):
-        problems.append(f"send audit has no rule for: {', '.join(sorted(sa['unmapped']))} - add one so these are checked")
-    if c.get("dupe_won"): problems.append(f"{c['dupe_won']} customers have 2+ Closed Won deals in the sales pipeline - duplicate-win dedup regressed, investigate")
 
-    lines = [f"*Sammy Weekly Sweep: {day}*", ""]
-    if prev:
-        dc, dm = c["paid"] - prev.get("paid", 0), c["mrr"] - prev.get("mrr", 0)
-        lines.append(f"*{c['paid']} paying customers / ${c['mrr']:,} MRR* "
-                     f"({'+' if dc >= 0 else ''}{dc} customers, {'+' if dm >= 0 else '-'}${abs(dm):,} vs last week)")
-    else:
-        lines.append(f"*{c['paid']} paying customers / ${c['mrr']:,} MRR* (baseline reset after redeploy, deltas resume next week)")
-    lines += ["",
-              "*Status*",
-              f"- Attribution coverage: {c['contacts'] - c['blank_channel']:,} of {c['contacts']:,} contacts have a source ({'100%' if not c['blank_channel'] else 'GAPS'})",
-              f"- New webhook contacts this week: {c['webhook_new']} ({c['webhook_nameless']} without names, {c['webhook_sysinbox']} system inboxes)",
-              f"- Deals: {c['deals'] - c['deals_no_source']} of {c['deals']} have a source; {c['deals_no_amount']} blank amounts (free/no-plan contacts)",
-              f"- Campaign visibility: {c['clay_campaign']} contacts carry a reply campaign",
-              f"- Sales tracking: {c['paid_dated']} of {c['paid']} paying customers have an exact conversion date; {c['closed_on_call_total']} all-time same-day demo closes",
-              ]
-    # Regression watches: every check still runs, but a permanently-green watch
-    # does not earn its own line every week. Detail appears only when one fires;
-    # the specifics then land in *Needs attention* above.
+    gq = f"{c['gone_quiet']} dormant paying customers (${c['gone_quiet_mrr']:,}/mo)"
+    if prev and "gone_quiet" in prev:
+        d = c["gone_quiet"] - prev["gone_quiet"]
+        gq += f", {'+' if d > 0 else ''}{d} vs last week" if d else ", unchanged vs last week"
+    lines = [f"*Sammy weekly - {day}*", "",
+             f"*Customers:* {c['paid']} paying, ${c['mrr']:,} MRR. +{c['new_payers']} new, -{c['churned']} churned this week.",
+             f"*Trials:* {c['trials']} started this week. {c['prev_activated']} of last week's {c['prev_trials']} "
+             f"({pct(c['prev_activated'], c['prev_trials'])}) made a first quote.",
+             f"*Gone Quiet:* {gq}.",
+             f"*First Six Weeks:* {c['fsw_hit3']} of the {c['fsw']} customers in their first six weeks have 3+ quotes since paying."]
     if "checked" in sa:
-        lines.append(f"- Email send audit: {sa['checked']} automated sends in the last 7 days checked against each "
-                     f"recipient's status at send time, {sum(sa['misfires'].values())} misfires")
-    watches = [("pricing", not (c["unknown_plans"] or c["unknown_promos"])),
-               ("future-dated conversions", not c.get("paid_future")),
-               ("Aircall auto-create", not c.get("aircall_new")),
-               ("duplicate wins", not c.get("dupe_won"))]
-    failing = [n for n, ok in watches if not ok]
-    if failing:
-        lines.append(f"- Regression watches: {', '.join(failing)} SEE PROBLEMS "
-                     f"({len(watches) - len(failing)} of {len(watches)} green)")
-    else:
-        lines.append(f"- Regression watches: all green "
-                     f"({', '.join(n for n, _ in watches)})")
-    if c.get("phoneless_new"):
-        lines += ["", f"*Contacts created this week with NO phone: {c['phoneless_new']}*"]
-        for src, e in c["phoneless_by_source"][:6]:
-            lines.append(f"- {src}: {e['n']}" + (f" ({e['nameless']} also nameless)" if e["nameless"] else ""))
-        lines.append("These get no call task until a phone lands. Tighten the source or enrich.")
+        n = sum(sa["misfires"].values())
+        lines.append(f"*Email health:* {sa['checked']} automated sends checked, "
+                     + ("0 misfires." if not n else f"{n} misfires (below)."))
+
+    problems = []
+    if sa.get("error"): problems.append(f"Email send audit did not run ({sa['error']}). Misfires were not checked this week.")
+    flows = {}
+    plain = {"recipient had already made estimates": "to people who had made estimates",
+             "recipient has been a paying customer": "to past or current paying customers",
+             "returning customer got the new-payer welcome": "to returning customers",
+             "sent outside Mon-Fri 07:00-18:00": "outside the send window",
+             "sent while trial_expired": "after the trial had ended", "sent while churned": "after they churned",
+             "sent while active_trial": "during a trial", "sent while paid_customer": "to paying customers"}
+    for k, n in (sa.get("misfires") or {}).items():  # key: "Flow (Email name): reason"
+        flow, rest = k.split(" (", 1)
+        email, reason = rest.split("): ", 1)
+        num = email.replace("Sammy - ", "")[:2]
+        r = flows.setdefault(flow, {}).setdefault(plain.get(reason, reason), [0, set()])
+        r[0] += n
+        if num.isdigit(): r[1].add(num)
+    for flow, rs in sorted(flows.items(), key=lambda kv: -sum(v[0] for v in kv[1].values())):
+        parts = [f"{n} {reason}" + (f" (email {'+'.join(sorted(nums))})" if nums else "")
+                 for reason, (n, nums) in sorted(rs.items(), key=lambda kv: -kv[1][0])]
+        problems.append(f"Email misfires, {flow}: {'; '.join(parts)}. Names in the cron log.")
+    if sa.get("unmapped"): problems.append(f"New automated email with no audit rule: {', '.join(sorted(sa['unmapped']))}")
+    if c["unknown_plans"]: problems.append(f"Unrecognised pricing plan {c['unknown_plans']}: MRR and deal values need the new mapping")
+    if c["unknown_promos"]: problems.append(f"Unrecognised promo code {c['unknown_promos']}: MRR will drift until it is mapped")
+    if c["paid_undated"]: problems.append(f"{c['paid_undated']} paying customers have no conversion date (stamper gap)")
+    if c["paid_future"]: problems.append(f"{c['paid_future']} conversions dated in the future (merge or clock artefact)")
+    if c["new_no_channel"]: problems.append(f"{c['new_no_channel']} contacts created this week have no source channel")
+    if c["webhook_sysinbox"]: problems.append(f"{c['webhook_sysinbox']} system-inbox contacts leaked in this week")
+    if c["aircall_new"]: problems.append(f"{c['aircall_new']} bare Aircall contact{'s' if c['aircall_new'] != 1 else ''} created this week: check whether Aircall auto-create is back on")
+    if c["new_dupe_won"]: problems.append(f"{c['new_dupe_won']} customers got a second Closed Won deal this week")
+    if c["stale_meetings"]: problems.append(f"{c['stale_meetings']} demo{'s' if c['stale_meetings'] != 1 else ''} held this week have no outcome marked")
+    if not c["dash_ok"]: problems.append("attribution.hirecharm.com is not returning all report sections")
 
     lines += ["", "*Needs attention*"]
-    if problems:
-        lines += [f"{i+1}. {p}" for i, p in enumerate(problems)]
-    else:
-        lines.append("Nothing. All checks green.")
-    if os.path.exists("NEW_THIS_WEEK.md"):
-        items = [l.strip() for l in open("NEW_THIS_WEEK.md") if l.strip().startswith("-")]
-        if items:
-            lines += ["", "*New since last sweep*"] + items
-    if os.path.exists("OUTSTANDING.md"):
-        items = [l.strip() for l in open("OUTSTANDING.md") if l.strip().startswith("-")]
-        if items:
-            lines += ["", "*Outstanding with the team*"] + [l for l in items]
+    lines += [f"{i + 1}. {p}" for i, p in enumerate(problems)] if problems else ["Nothing new this week."]
     return "\n".join(lines)
 
 
