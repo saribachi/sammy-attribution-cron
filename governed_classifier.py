@@ -51,7 +51,9 @@ def req(method, url, body=None):
             resp = urllib.request.urlopen(r, timeout=60)
             return resp.status, (json.load(resp) if resp.status not in (204,) else {})
         except urllib.error.HTTPError as e:
-            if e.code in (429, 502, 503): time.sleep(3); continue
+            if e.code in (429, 502, 503):
+                wait = e.headers.get("Retry-After")
+                time.sleep(float(wait) if wait else min(2 ** _ * 2, 30)); continue
             return e.code, e.read().decode()[:200]
     return 0, "retry-exhausted"
 
