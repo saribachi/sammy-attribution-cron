@@ -466,11 +466,13 @@ def stamp_demo_reminder_time():
     print(f"demo reminder time+link: {len(meetings)} upcoming demos, {len(want)} contacts, {len(updates)} stamped/cleared" + ("" if COMMIT else " [dry-run]"))
 
 def stamp_noshow_rebooked():
-    """has_upcoming_demo on Demo No-Show deals = true when any contact on the deal has
+    """has_upcoming_demo on Demo No-Show deals = true once any contact on the deal has
     an upcoming Lucas demo (next_lucas_demo_time in the future, stamped just before
-    this runs). The No-Show cadence's goal is has_upcoming_demo = true, so the
-    "missed you" follow-ups stop once someone rebooks. Deals that have left the
-    No-Show stage are reset to false so a later no-show starts clean."""
+    this runs). The No-Show cadence only enrols deals where it is not true and
+    unenrols any that stop qualifying, so the "missed you" follow-ups stop once
+    someone rebooks. Deal-based flows take no goal, hence enrolment, not a goal.
+    The flag is sticky while the deal stays in No-Show, and is reset to false when
+    the deal leaves the stage so a later no-show starts clean."""
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc)
     NOSHOW = "3774214843"
@@ -509,9 +511,13 @@ def stamp_noshow_rebooked():
         time.sleep(0.2)
     updates = []
     for d in noshow:
-        want = "true" if any(c in upcoming for c in contacts.get(d["id"], [])) else "false"
-        if (d["properties"].get("has_upcoming_demo") or "false") != want:
-            updates.append({"id": d["id"], "properties": {"has_upcoming_demo": want}})
+        # Sticky: once a no-show deal's contact rebooks, the flag stays true until the
+        # deal leaves the No-Show stage. Clearing it when the rebooked demo passes
+        # would make the deal meet the cadence's enrolment again and restart it.
+        if (d["properties"].get("has_upcoming_demo") or "false") == "true":
+            continue
+        if any(c in upcoming for c in contacts.get(d["id"], [])):
+            updates.append({"id": d["id"], "properties": {"has_upcoming_demo": "true"}})
     noshow_ids = set(ids)
     for d in flagged:
         if d["id"] not in noshow_ids:
