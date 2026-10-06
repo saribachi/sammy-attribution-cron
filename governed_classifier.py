@@ -465,6 +465,64 @@ def stamp_demo_reminder_time():
             time.sleep(0.3)
     print(f"demo reminder time+link: {len(meetings)} upcoming demos, {len(want)} contacts, {len(updates)} stamped/cleared" + ("" if COMMIT else " [dry-run]"))
 
+def stamp_noshow_rebooked():
+    """has_upcoming_demo on Demo No-Show deals = true when any contact on the deal has
+    an upcoming Lucas demo (next_lucas_demo_time in the future, stamped just before
+    this runs). The No-Show cadence's goal is has_upcoming_demo = true, so the
+    "missed you" follow-ups stop once someone rebooks. Deals that have left the
+    No-Show stage are reset to false so a later no-show starts clean."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    NOSHOW = "3774214843"
+    def deals(filters):
+        out, after = [], None
+        while True:
+            b = {"filterGroups": [{"filters": filters}], "properties": ["dealstage", "has_upcoming_demo"], "limit": 100}
+            if after: b["after"] = after
+            st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/deals/search", b)
+            out += d.get("results", [])
+            after = d.get("paging", {}).get("next", {}).get("after")
+            if not after: return out
+            time.sleep(0.2)
+    noshow = deals([{"propertyName": "dealstage", "operator": "EQ", "value": NOSHOW}])
+    flagged = deals([{"propertyName": "has_upcoming_demo", "operator": "EQ", "value": "true"}])
+    contacts = {}
+    ids = [d["id"] for d in noshow]
+    for i in range(0, len(ids), 100):
+        st, a = req("POST", "https://api.hubapi.com/crm/v4/associations/deals/contacts/batch/read",
+                    {"inputs": [{"id": x} for x in ids[i:i+100]]})
+        for r in a.get("results", []):
+            contacts[str(r["from"]["id"])] = [str(t["toObjectId"]) for t in r.get("to", [])]
+        time.sleep(0.2)
+    allc = sorted({c for v in contacts.values() for c in v})
+    upcoming = set()
+    for i in range(0, len(allc), 100):
+        st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/batch/read",
+                    {"properties": ["next_lucas_demo_time"], "inputs": [{"id": c} for c in allc[i:i+100]]})
+        for r in d.get("results", []):
+            t = r["properties"].get("next_lucas_demo_time")
+            if t:
+                try:
+                    if datetime.fromisoformat(t.replace("Z", "+00:00")) > now: upcoming.add(r["id"])
+                except ValueError:
+                    pass
+        time.sleep(0.2)
+    updates = []
+    for d in noshow:
+        want = "true" if any(c in upcoming for c in contacts.get(d["id"], [])) else "false"
+        if (d["properties"].get("has_upcoming_demo") or "false") != want:
+            updates.append({"id": d["id"], "properties": {"has_upcoming_demo": want}})
+    noshow_ids = set(ids)
+    for d in flagged:
+        if d["id"] not in noshow_ids:
+            updates.append({"id": d["id"], "properties": {"has_upcoming_demo": "false"}})
+    if COMMIT:
+        for i in range(0, len(updates), 100):
+            req("POST", "https://api.hubapi.com/crm/v3/objects/deals/batch/update", {"inputs": updates[i:i+100]})
+            time.sleep(0.3)
+    rebooked = sum(1 for d in noshow if any(c in upcoming for c in contacts.get(d["id"], [])))
+    print(f"no-show rebook stamper: {len(noshow)} no-show deals, {rebooked} rebooked, {len(updates)} updated" + ("" if COMMIT else " [dry-run]"))
+
 def route_tickets():
     """Support routing (Krishna's rule Aug 6): current customer tickets -> Krishna,
     everyone else (trial etc) -> Lucas. Routes by the associated contact's
@@ -1033,6 +1091,10 @@ def main():
     stamp_quotes_since_purchase()
     stamp_demo_meetings()
     stamp_demo_reminder_time()
+    try:
+        stamp_noshow_rebooked()
+    except Exception as e:  # never let this stop the rest of the hourly run
+        print("no-show rebook stamper error:", e, flush=True)
     guard_merge_overwrites()
     route_tickets()
     ticket_followups()

@@ -311,6 +311,30 @@ def audit_sends(days=7):
     return {"checked": checked, "misfires": {k: len(v) for k, v in found.items()}, "unmapped": unmapped}
 
 
+def misfire_lines(sa):
+    """One plain line per flow from audit_sends() output."""
+    problems = []
+    flows = {}
+    plain = {"recipient had already made estimates": "to people who had made estimates",
+             "recipient has been a paying customer": "to past or current paying customers",
+             "returning customer got the new-payer welcome": "to returning customers",
+             "sent outside Mon-Fri 07:00-18:00": "outside the send window",
+             "sent while trial_expired": "after the trial had ended", "sent while churned": "after they churned",
+             "sent while active_trial": "during a trial", "sent while paid_customer": "to paying customers"}
+    for k, n in (sa.get("misfires") or {}).items():  # key: "Flow (Email name): reason"
+        flow, rest = k.split(" (", 1)
+        email, reason = rest.split("): ", 1)
+        num = email.replace("Sammy - ", "")[:2]
+        r = flows.setdefault(flow, {}).setdefault(plain.get(reason, reason), [0, set()])
+        r[0] += n
+        if num.isdigit(): r[1].add(num)
+    for flow, rs in sorted(flows.items(), key=lambda kv: -sum(v[0] for v in kv[1].values())):
+        parts = [f"{n} {reason}" + (f" (email {'+'.join(sorted(nums))})" if nums else "")
+                 for reason, (n, nums) in sorted(rs.items(), key=lambda kv: -kv[1][0])]
+        problems.append(f"Email misfires, {flow}: {'; '.join(parts)}. Names in the cron log.")
+    return problems
+
+
 def compose(c, prev):
     """Short by design: what changed this week, then only what is new or worsening.
     A watch that is quiet says nothing."""
@@ -335,24 +359,7 @@ def compose(c, prev):
 
     problems = []
     if sa.get("error"): problems.append(f"Email send audit did not run ({sa['error']}). Misfires were not checked this week.")
-    flows = {}
-    plain = {"recipient had already made estimates": "to people who had made estimates",
-             "recipient has been a paying customer": "to past or current paying customers",
-             "returning customer got the new-payer welcome": "to returning customers",
-             "sent outside Mon-Fri 07:00-18:00": "outside the send window",
-             "sent while trial_expired": "after the trial had ended", "sent while churned": "after they churned",
-             "sent while active_trial": "during a trial", "sent while paid_customer": "to paying customers"}
-    for k, n in (sa.get("misfires") or {}).items():  # key: "Flow (Email name): reason"
-        flow, rest = k.split(" (", 1)
-        email, reason = rest.split("): ", 1)
-        num = email.replace("Sammy - ", "")[:2]
-        r = flows.setdefault(flow, {}).setdefault(plain.get(reason, reason), [0, set()])
-        r[0] += n
-        if num.isdigit(): r[1].add(num)
-    for flow, rs in sorted(flows.items(), key=lambda kv: -sum(v[0] for v in kv[1].values())):
-        parts = [f"{n} {reason}" + (f" (email {'+'.join(sorted(nums))})" if nums else "")
-                 for reason, (n, nums) in sorted(rs.items(), key=lambda kv: -kv[1][0])]
-        problems.append(f"Email misfires, {flow}: {'; '.join(parts)}. Names in the cron log.")
+    problems += misfire_lines(sa)
     if sa.get("unmapped"): problems.append(f"New automated email with no audit rule: {', '.join(sorted(sa['unmapped']))}")
     if c["unknown_plans"]: problems.append(f"Unrecognised pricing plan {c['unknown_plans']}: MRR and deal values need the new mapping")
     if c["unknown_promos"]: problems.append(f"Unrecognised promo code {c['unknown_promos']}: MRR will drift until it is mapped")
@@ -412,5 +419,47 @@ def maybe_weekly_sweep():
         print("sweep error:", e, flush=True)
 
 
+DAILY_MARKER = "/tmp/daily_audit_day.txt"
+
+
+def maybe_daily_audit():
+    """Daily email misfire check. Runs once per UTC day at/after 21:00 UTC (8am
+    Melbourne in summer) over the last 24 hours, and posts ONLY when something is
+    wrong. A clean day says nothing. Skipped on a day the weekly sweep posted,
+    since that post already carries the same check over 7 days."""
+    if not WEBHOOK:
+        return
+    now = datetime.now(timezone.utc)
+    if now.hour < 21:
+        return
+    day = now.strftime("%Y-%m-%d")
+    if (open(DAILY_MARKER).read().strip() if os.path.exists(DAILY_MARKER) else "") == day:
+        return
+    if (open(MARKER).read().strip() if os.path.exists(MARKER) else "") == now.strftime("%G-W%V") and now.weekday() == 0:
+        open(DAILY_MARKER, "w").write(day)
+        return
+    try:
+        sa = audit_sends(days=1)
+    except Exception as e:
+        sa = {"error": f"{type(e).__name__}: {e}"}
+    lines = []
+    if sa.get("error"):
+        lines.append(f"The daily email check did not run ({sa['error']}). Emails were not checked today.")
+    lines += misfire_lines(sa)
+    if sa.get("unmapped"):
+        lines.append(f"New automated email with no audit rule: {', '.join(sorted(sa['unmapped']))}")
+    if lines:
+        try:
+            post("*Sammy email alert*\n" + "\n".join(f"- {l}" for l in lines))
+            print("daily audit posted:", len(lines), "issue(s)", flush=True)
+        except Exception as e:
+            print("daily audit post failed:", e, flush=True)
+            return
+    else:
+        print(f"daily audit: {sa.get('checked', 0)} sends checked, clean", flush=True)
+    open(DAILY_MARKER, "w").write(day)
+
+
 if __name__ == "__main__":
     maybe_weekly_sweep()
+    maybe_daily_audit()
