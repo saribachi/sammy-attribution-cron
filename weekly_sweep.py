@@ -267,6 +267,10 @@ def audit_sends(days=7):
             st, ec = h.get("user_status", []), h.get("estimate_count", [])
             seen = set()
             for e in reversed(h.get("hs_email_last_email_name", [])):  # oldest first
+                # HubSpot copies send history onto a new contact when an address is
+                # changed or split off ("Updated in response to a contact being
+                # created."). That is a copy of an old send, not a send to this contact.
+                if (e.get("sourceId") or "").startswith("Updated in response to"): continue
                 name, t = e["value"], _ts(e["timestamp"])
                 if name in seen: continue
                 seen.add(name)
