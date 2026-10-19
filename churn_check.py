@@ -21,7 +21,11 @@ record that Sammy's team has marked checked (churn_check_checked_on on or after
 the day it went churned).
 
 Properties it owns (group churn_check): churn_check_flag, churn_check_detail,
-churn_check_linked_record, churn_check_flagged_at, churn_check_quoted_elsewhere.
+churn_check_linked_record, churn_check_flagged_at, churn_check_quoted_elsewhere,
+churn_check_ever_flagged. The last one is STICKY: set true the first time a record
+is flagged and never cleared, so when Sammy hand-fixes a record from churned to
+paid, "Welcome, new payer" can hold back (19 Oct: Joshua Marcinkewycz got the
+welcome twice, once per record, after a hand-fix).
 Sammy's team owns churn_check_checked_on.
 
   python3 churn_check.py                dry run, prints every change
@@ -49,7 +53,7 @@ FLAG_LABEL = {"paying_elsewhere": "Looks wrong: the business pays on another rec
 P = ["email", "firstname", "lastname", "company", "phone", "mobilephone", "user_status", "estimate_count",
      "last_estimate_date", "last_app_login_date", "became_paid_customer_date",
      "churn_check_flag", "churn_check_detail", "churn_check_linked_record", "churn_check_flagged_at",
-     "churn_check_quoted_elsewhere", "churn_check_checked_on"]
+     "churn_check_quoted_elsewhere", "churn_check_checked_on", "churn_check_ever_flagged"]
 
 
 def req(method, url, body=None):
@@ -186,6 +190,7 @@ def run(commit=False, only=None):
                 flag, detail = "active_after_churn", f"Went churned {day}, then {', '.join(acts)}"
         want[cid] = {"churn_check_flag": flag, "churn_check_detail": detail if flag else "",
                      "churn_check_linked_record": ",".join(linked) if flag else ""}
+        if flag: want[cid]["churn_check_ever_flagged"] = "true"  # sticky, never cleared
 
     # records no longer churned lose any flag
     for c in prior:
