@@ -1101,6 +1101,11 @@ def main():
         stamp_noshow_rebooked()
     except Exception as e:  # never let this stop the rest of the hourly run
         print("no-show rebook stamper error:", e, flush=True)
+    try:  # churned records whose status looks wrong (Ops ticket 340512582363, until SAM-258 ships)
+        import churn_check
+        churn_check.run(commit=COMMIT)
+    except Exception as e:  # never let this stop the rest of the hourly run
+        print("churn check error:", e, flush=True)
     guard_merge_overwrites()
     route_tickets()
     ticket_followups()

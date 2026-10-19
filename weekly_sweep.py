@@ -339,6 +339,41 @@ def misfire_lines(sa):
     return problems
 
 
+CHURN_SLACK = os.environ.get("CHURN_CHECK_SLACK") == "1"  # off until Sammy agrees to see these lines
+CHURN_LIST = "[Churn check] Churned, but the status looks wrong"
+
+
+def churn_counts(since_hours):
+    """Counts from the churn check's own properties. Names stay in the cron log."""
+    try:
+        rows = _search_all("contacts", [{"propertyName": "churn_check_flag", "operator": "HAS_PROPERTY"}],
+                           ["email", "churn_check_flag", "churn_check_flagged_at", "churn_check_detail"])
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+    cut = datetime.now(timezone.utc) - timedelta(hours=since_hours)
+    out = {"total": len(rows), "by": {}, "new": 0, "new_paying": []}
+    for r in rows:
+        p = r["properties"]
+        out["by"][p["churn_check_flag"]] = out["by"].get(p["churn_check_flag"], 0) + 1
+        t = _when(p.get("churn_check_flagged_at"))
+        if t and t >= cut:
+            out["new"] += 1
+            if p["churn_check_flag"] == "paying_elsewhere":
+                out["new_paying"].append(p.get("email"))
+                print("churn check: new paying_elsewhere ->", p.get("email"), "|", p.get("churn_check_detail"), flush=True)
+    return out
+
+
+def churn_line(cc):
+    if cc.get("error"): return None
+    b = cc["by"]
+    parts = [f"{b[k]} {label}" for k, label in [("paying_elsewhere", "where the business pays on another record"),
+             ("live_elsewhere", "with a live account on another record"),
+             ("active_after_churn", "who quoted or paid after going churned")] if b.get(k)]
+    head = f"*Churn check:* {cc['total']} churned records look wrong" + (f" ({'; '.join(parts)})" if parts else "")
+    return head + f", {cc['new']} new this week. List: {CHURN_LIST}."
+
+
 def compose(c, prev):
     """Short by design: what changed this week, then only what is new or worsening.
     A watch that is quiet says nothing."""
@@ -361,7 +396,14 @@ def compose(c, prev):
         lines.append(f"*Email health:* {sa['checked']} automated sends checked, "
                      + ("0 misfires." if not n else f"{n} misfires (below)."))
 
+    cc = c.get("churn_check") or {}
+    if CHURN_SLACK and cc and churn_line(cc):
+        lines.append(churn_line(cc))
+
     problems = []
+    if CHURN_SLACK and cc.get("new_paying"):
+        problems.append(f"{len(cc['new_paying'])} churned record{'s' if len(cc['new_paying']) != 1 else ''} flagged this week "
+                        f"{'belong' if len(cc['new_paying']) != 1 else 'belongs'} to a business that pays on another record: do not ring as churned. Names in {CHURN_LIST}.")
     if sa.get("error"): problems.append(f"Email send audit did not run ({sa['error']}). Misfires were not checked this week.")
     problems += misfire_lines(sa)
     if sa.get("unmapped"): problems.append(f"New automated email with no audit rule: {', '.join(sorted(sa['unmapped']))}")
@@ -404,6 +446,7 @@ def maybe_weekly_sweep():
         return  # already posted this week (marker, or env guard for a Monday-afternoon redeploy)
     try:
         c = collect()
+        c["churn_check"] = churn_counts(24 * 7)
         prev = json.load(open(BASELINE)) if os.path.exists(BASELINE) else None
         msg = compose(c, prev)
         resp = post(msg)
@@ -452,6 +495,14 @@ def maybe_daily_audit():
     lines += misfire_lines(sa)
     if sa.get("unmapped"):
         lines.append(f"New automated email with no audit rule: {', '.join(sorted(sa['unmapped']))}")
+    if CHURN_SLACK:
+        cc = churn_counts(24)
+        if cc.get("new_paying"):
+            n = len(cc["new_paying"])
+            lines.append(f"{n} churned record{'s' if n != 1 else ''} newly flagged: the business pays on another record, "
+                         f"so do not ring as churned. See {CHURN_LIST}.")
+    else:
+        churn_counts(24)  # still logs any new paying_elsewhere names to the container log
     if lines:
         try:
             post("*Sammy email alert*\n" + "\n".join(f"- {l}" for l in lines))
