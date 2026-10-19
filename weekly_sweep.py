@@ -339,7 +339,7 @@ def misfire_lines(sa):
     return problems
 
 
-CHURN_SLACK = os.environ.get("CHURN_CHECK_SLACK") == "1"  # off until Sammy agrees to see these lines
+CHURN_SLACK = os.environ.get("CHURN_CHECK_SLACK", "1") == "1"  # internal channel (Sarah + Chris); set 0 to mute
 CHURN_LIST = "[Churn check] Churned, but the status looks wrong"
 
 
