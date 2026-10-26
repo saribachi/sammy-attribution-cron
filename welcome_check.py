@@ -15,7 +15,7 @@ check (the Welcome suppresses those on purpose, list 1049). Then:
 A carded trial who later pays already had the Welcome as a trial: no task.
 
 Properties it owns (group welcome_check): welcome_failed_on, welcome_failed_reason,
-welcome_failed_detail, welcome_failed_task_id, welcome_returning_customer.
+welcome_returning_customer. The explanation lives in the task, not on the contact.
 welcome_failed_on is the one-task-per-contact guard: it is written before the task and
 never cleared, so a contact gets at most one task, ever.
 
@@ -244,10 +244,9 @@ def run(commit=False, only=None, test=None):
         print(f"welcome check: {f['id']} {f['p'].get('email')} | {f['reason']} | {subj}" + ("" if commit else " [dry-run]"), flush=True)
         if not commit: continue
         stamp = {"welcome_failed_on": int(f["when"].timestamp() * 1000), "welcome_failed_reason": f["reason"],
-                 "welcome_failed_detail": f["why"][:1000], "welcome_returning_customer": "true" if f["returning"] else "false"}
+                 "welcome_returning_customer": "true" if f["returning"] else "false"}
         req("PATCH", f"/crm/v3/objects/contacts/{f['id']}", {"properties": stamp})  # claim first: never two tasks
         tid = create_task(f["id"], subj, body, KRISHNA, now)
-        req("PATCH", f"/crm/v3/objects/contacts/{f['id']}", {"properties": {"welcome_failed_task_id": tid}})
         print(f"welcome check: task {tid} -> Krishna for {f['id']}", flush=True)
     print(f"welcome check: {len(found)} new welcome failures" + ("" if commit else " [dry-run]"), flush=True)
     return found
