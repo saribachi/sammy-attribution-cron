@@ -1106,6 +1106,11 @@ def main():
         churn_check.run(commit=COMMIT)
     except Exception as e:  # never let this stop the rest of the hourly run
         print("churn check error:", e, flush=True)
+    try:  # "Welcome, new payer" didn't reach them -> one task for Krishna (19 Oct call); WELCOME_CHECK=off mutes
+        import welcome_check
+        welcome_check.run(commit=COMMIT)
+    except Exception as e:  # never let this stop the rest of the hourly run
+        print("welcome check error:", e, flush=True)
     guard_merge_overwrites()
     route_tickets()
     ticket_followups()
