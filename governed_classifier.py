@@ -39,7 +39,7 @@ import re as _re
 PAID_URL_RX = _re.compile(r"fbclid|gclid=|ttclid|utm_source=(facebook|meta|instagram|fb)|utm_medium=(cpc|ppc|paid)", _re.I)
 FIELDS = ["email", "original_source_channel", "hs_analytics_source", "hs_object_source_label",
           "hs_object_source_detail_1", "sammy_utm_source", "sammy_utm_medium",
-          "sammy_utm_campaign", "first_utm", "aircall_last_call_at", "phone", "mobilephone",
+          "sammy_utm_campaign", "first_utm", "aircall_last_call_at", "phone", "mobilephone", "country",
           "hs_google_click_id", "hs_facebook_click_id", "hs_analytics_first_url", "hs_analytics_last_url"]
 
 def req(method, url, body=None):
@@ -821,18 +821,23 @@ def ration_lucas_tasks():
 
 def normalize_phones(recs):
     """AU numbers stored without +61 (bare 1300/1800, 04 mobiles, 0x landlines) are
-    unparseable by HubSpot, which breaks click-to-call. Normalize to E.164 hourly."""
+    unparseable by HubSpot, which breaks click-to-call. Normalize to E.164 hourly.
+    Australia is the default. Contacts known to be in NZ (country NZ, .nz email) are left
+    for HubSpot to format; an AU mobile saved under HubSpot's NZ picker default is repaired."""
     import re as _re2
-    def fix(p):
+    def fix(p, nz=False):
         if not p: return None
         d = _re2.sub(r"\D", "", p)
         if p.strip().startswith("+"):
+            # AU mobile saved with the NZ country picker: +64 4xx xxx xxx (NZ numbers starting 4 have 8 digits, not 9)
+            if d.startswith("644") and len(d) == 11 and not nz: return "+61" + d[2:]
             # +61 0xxxxxxxxx double-prefix: drop the 0 after 61
             if d.startswith("610") and len(d) == 12: return "+61" + d[3:]
             # AU 1800/1300 wrongly saved with +1: 9 digits starting 800/300
             if d.startswith("1800") and len(d) == 10 and p.strip().startswith("+1 8"): return "+61" + d
             if d.startswith("1300") and len(d) == 10 and p.strip().startswith("+1 3"): return "+61" + d
             return None
+        if nz: return None  # NZ contact: don't force +61 (022/027 mobiles look like AU 02 numbers)
         if d.startswith("61") and len(d) in (11, 12): return "+" + d
         if (d.startswith("1300") or d.startswith("1800")) and len(d) == 10: return "+61" + d
         if d.startswith("13") and len(d) == 6: return "+61" + d
@@ -841,8 +846,10 @@ def normalize_phones(recs):
     updates = []
     for r in recs:
         props = {}
+        nz = (r["properties"].get("country") or "").strip().lower() in ("nz", "new zealand") \
+            or (r["properties"].get("email") or "").lower().endswith(".nz")
         for f in ("phone", "mobilephone"):
-            n = fix(r["properties"].get(f))
+            n = fix(r["properties"].get(f), nz)
             if n: props[f] = n
         if props: updates.append({"id": r["id"], "properties": props})
     if updates and COMMIT:
