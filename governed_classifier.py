@@ -256,6 +256,53 @@ def stamp_became_paid():
     print(f"became-paid stamper: {len(contacts)} paid customers, {len(updates)} dates corrected to first genuine conversion" + ("" if COMMIT else " [dry-run]"))
 
 
+def stamp_returned_paid():
+    """returned_paid_on = latest COMEBACK into paid_customer: paid before, then churned for 24h+,
+    then paid again. Lets 'Welcome, new payer' (4898086609) welcome returning customers, since
+    became_paid_customer_date keeps the FIRST paid date. Churn stints under 24h are sync blips
+    (same rule as welcome_check). Trial-only churners who then pay for the first time are not
+    comebacks: the flow's first-paid branch already welcomes them. Changes only on a new comeback,
+    which is the flow's re-enrol trigger. Recomputed hourly; never cleared."""
+    from datetime import datetime, timedelta
+    def when(t): return datetime.fromisoformat(t.replace("Z", "+00:00"))
+    contacts, after = [], None
+    while True:
+        b = {"filterGroups": [{"filters": [
+            {"propertyName": "user_status", "operator": "EQ", "value": "paid_customer"}]}], "limit": 100}
+        if after: b["after"] = after
+        st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/search", b)
+        contacts += d.get("results", [])
+        after = d.get("paging", {}).get("next", {}).get("after")
+        if not after: break
+        time.sleep(0.2)
+    updates = []
+    for i in range(0, len(contacts), 50):
+        st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/batch/read",
+                    {"inputs": [{"id": c["id"]} for c in contacts[i:i+50]],
+                     "properties": ["returned_paid_on"],
+                     "propertiesWithHistory": ["user_status"]})
+        for r in d.get("results", []):
+            real = []  # genuine changes only, oldest first
+            for v in reversed(r.get("propertiesWithHistory", {}).get("user_status") or []):
+                if not real or real[-1][0] != v.get("value"): real.append((v.get("value"), v["timestamp"]))
+            back, paid_before, churn_ok = None, False, False
+            for j, (val, t) in enumerate(real):
+                if val == "churned" and paid_before and j + 1 < len(real) and when(real[j+1][1]) - when(t) >= timedelta(hours=24):
+                    churn_ok = True
+                if val == "paid_customer":
+                    if churn_ok: back = t
+                    paid_before, churn_ok = True, False
+            if back and r["properties"].get("returned_paid_on") != back:
+                updates.append({"id": r["id"], "properties": {"returned_paid_on": back}})
+        time.sleep(0.2)
+    if COMMIT:
+        for i in range(0, len(updates), 100):
+            st, d = req("POST", "https://api.hubapi.com/crm/v3/objects/contacts/batch/update", {"inputs": updates[i:i+100]})
+            if st != 200: print(f"returned-paid stamper: batch update failed {st} {d}")
+            time.sleep(0.3)
+    print(f"returned-paid stamper: {len(contacts)} paid customers, {len(updates)} comeback dates stamped" + ("" if COMMIT else " [dry-run]"))
+
+
 def stamp_closed_on_call():
     """closed_on_call = became a paying customer the SAME Melbourne day as a
     completed meeting with Lucas. Cross-object comparison HubSpot calculated
@@ -1100,6 +1147,7 @@ def main():
     stamp_deal_sources()
     stamp_deal_amounts()
     stamp_became_paid()
+    stamp_returned_paid()
     stamp_closed_on_call()
     stamp_quotes_since_purchase()
     stamp_demo_meetings()
